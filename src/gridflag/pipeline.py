@@ -11,7 +11,6 @@ import numpy as np
 from gridflag.config import GridFlagConfig
 from gridflag.coordinates import (
     C_M_S,
-    compute_N,
     grid_shape,
     hermitian_fold,
     scale_uv,
@@ -19,7 +18,13 @@ from gridflag.coordinates import (
 )
 from gridflag.flagger import flag_visibilities
 from gridflag.gridder import compute_cell_stats
-from gridflag.msio import get_spw_info, read_chunks, resolve_data_column, write_flags
+from gridflag.msio import (
+    get_max_baseline_m,
+    get_spw_info,
+    read_chunks,
+    resolve_data_column,
+    write_flags,
+)
 from gridflag.thresholds import (
     annular_threshold,
     combine_thresholds,
@@ -46,34 +51,33 @@ def _extract_quantity(data: np.ndarray, quantity: str) -> np.ndarray:
 
 def _compute_global_N(
     ms_path: str,
-    data_column: str,
-    config: GridFlagConfig,
     all_spws: list[dict],
+    cell_size: float,
 ) -> int:
-    """Determine global grid half-size N by scanning UVW extents.
+    """Determine grid half-size N from antenna positions and channel frequencies.
 
-    We compute the maximum |u|, |v| in wavelengths across all SPWs
-    using just the UVW column and channel frequencies (no DATA read).
+    ``uv_max = max_baseline_m × max_freq / c``, derived entirely from
+    the ANTENNA and SPECTRAL_WINDOW metadata tables — no visibility read.
     """
-    global_N = 0
-    for spw_info in all_spws:
-        chan_freqs = np.array(spw_info["chan_freqs"])
-        max_freq = float(np.max(chan_freqs))
-
-        for chunk in read_chunks(ms_path, data_column, config.chunk_size,
-                                 spw_info["spw_id"]):
-            # Max UV in wavelengths = max(|uvw_m|) * max_freq / c
-            # After fold, v≥0, u unrestricted — use abs of both.
-            uvw_max = np.max(np.abs(chunk.uvw[:, :2]))
-            uv_lambda_max = uvw_max * max_freq / C_M_S
-            N = int(np.ceil(uv_lambda_max / config.cell_size))
-            global_N = max(global_N, N)
-
-    return global_N
+    max_bl = get_max_baseline_m(ms_path)
+    max_freq = max(float(np.max(s["chan_freqs"])) for s in all_spws)
+    uv_max = max_bl * max_freq / C_M_S
+    N = int(np.ceil(uv_max / cell_size))
+    return N
 
 
-def run(ms_path: str, config: GridFlagConfig | None = None) -> dict:
+def run(
+    ms_path: str,
+    config: GridFlagConfig | None = None,
+    plot_dir: str | Path | None = None,
+) -> dict:
     """Run the full GRIDflag pipeline on a measurement set.
+
+    Parameters
+    ----------
+    ms_path : path to CASA Measurement Set.
+    config : algorithm configuration (defaults applied if None).
+    plot_dir : if set, write before/after diagnostic PNGs here.
 
     Returns a summary dict with flag statistics.
     """
@@ -92,8 +96,8 @@ def run(ms_path: str, config: GridFlagConfig | None = None) -> dict:
         all_spws = [s for s in all_spws if s["spw_id"] in config.spw_ids]
     log.info("Processing %d SPW(s)", len(all_spws))
 
-    # Determine global grid size.
-    global_N = _compute_global_N(ms_path, data_column, config, all_spws)
+    # Determine global grid size from metadata (no data scan).
+    global_N = _compute_global_N(ms_path, all_spws, config.cell_size)
     gshape = grid_shape(global_N)
     log.info("Grid shape: %s  (N=%d)", gshape, global_N)
 
@@ -199,12 +203,16 @@ def run(ms_path: str, config: GridFlagConfig | None = None) -> dict:
                 100.0 * n_flagged / max(n_total, 1),
             )
 
+            # Store flag mask in Zarr for post-flag grid recomputation.
+            store.store_grid(spw_id, corr, "flag_mask", flags.astype(np.uint8))
+
             if n_flagged > 0:
                 idx = np.where(flags)[0]
                 all_flags.append({
                     "row_indices": flat["row_indices"][idx],
                     "chan_indices": flat["chan_indices"][idx],
                     "corr_id": corr,
+                    "spw_id": spw_id,
                     "n_flagged": n_flagged,
                 })
 
@@ -224,9 +232,31 @@ def run(ms_path: str, config: GridFlagConfig | None = None) -> dict:
 
     log.info("Total newly flagged: %d", total_newly_flagged)
 
+    # ── Diagnostic plots ────────────────────────────────────────────
+    plot_paths: list[str] = []
+    if plot_dir is not None:
+        from gridflag.plotting import plot_before_after
+
+        for spw_info in all_spws:
+            spw_id = spw_info["spw_id"]
+            for corr in range(spw_info["n_corr"]):
+                try:
+                    paths = plot_before_after(
+                        store, spw_id, corr,
+                        config.cell_size, global_N,
+                        plot_dir,
+                    )
+                    plot_paths.extend(str(p) for p in paths)
+                except Exception:
+                    log.warning(
+                        "Failed to plot SPW %d corr %d", spw_id, corr,
+                        exc_info=True,
+                    )
+
     return {
         "ms_path": ms_path,
         "zarr_path": str(zarr_path),
         "grid_shape": gshape,
         "total_newly_flagged": total_newly_flagged,
+        "plots": plot_paths,
     }

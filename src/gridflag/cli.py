@@ -24,6 +24,8 @@ from gridflag.utils import setup_logging
 @click.option("--min-neighbors", default=3, help="Min occupied neighbors for local threshold.")
 @click.option("--spw", "spw_ids", multiple=True, type=int, help="SPW IDs to process.")
 @click.option("--field", "field_ids", multiple=True, type=int, help="Field IDs to process.")
+@click.option("--plot-dir", default=None,
+              type=click.Path(), help="Directory for before/after diagnostic plots.")
 @click.option("--log-level", default="INFO",
               type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR"]))
 def main(
@@ -39,6 +41,7 @@ def main(
     min_neighbors: int,
     spw_ids: tuple[int, ...],
     field_ids: tuple[int, ...],
+    plot_dir: str | None,
     log_level: str,
 ) -> None:
     """Run GRIDflag on a CASA Measurement Set."""
@@ -60,6 +63,8 @@ def main(
 
     from gridflag.pipeline import run
 
-    result = run(ms_path, config)
+    result = run(ms_path, config, plot_dir=plot_dir)
     click.echo(f"Flagged {result['total_newly_flagged']} visibilities.")
     click.echo(f"Zarr store: {result['zarr_path']}")
+    if result.get("plots"):
+        click.echo(f"Plots: {', '.join(result['plots'])}")

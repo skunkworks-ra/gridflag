@@ -140,6 +140,20 @@ def read_chunks(
         tb.close()
 
 
+def get_max_baseline_m(ms_path: str) -> float:
+    """Return the maximum baseline length in metres from the ANTENNA table."""
+    casatools = _import_casatools()
+    tb = casatools.table()
+    tb.open(f"{ms_path}/ANTENNA", nomodify=True)
+    pos = tb.getcol("POSITION")  # (3, n_ant)
+    tb.close()
+    pos = pos.T  # (n_ant, 3)
+    # Max pairwise distance.
+    from scipy.spatial.distance import pdist
+
+    return float(np.max(pdist(pos)))
+
+
 def get_spw_info(ms_path: str) -> list[dict]:
     """Return per-SPW metadata: n_chan, n_corr, ref_freq, chan_freqs."""
     casatools = _import_casatools()
