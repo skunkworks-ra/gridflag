@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68.0", "setuptools-scm>=8.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gridflag"
+version = "0.1.0"
+description = "UV-plane RFI flagging for radio interferometric data"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "zarr>=2.16,<3",
+    "click>=8.0",
+]
+
+[project.optional-dependencies]
+casa = ["casatools>=6.5"]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+]
+
+[project.scripts]
+gridflag = "gridflag.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
