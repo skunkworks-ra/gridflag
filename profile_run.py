@@ -87,11 +87,13 @@ def main():
                     help="Number of workers (0 = auto-detect)")
     args = ap.parse_args()
 
-    log_level = logging.DEBUG if args.debug else logging.INFO
     logging.basicConfig(
-        level=log_level,
+        level=logging.INFO,
         format="%(asctime)s %(levelname)-8s [%(name)s] %(message)s",
     )
+    if args.debug:
+        # Only elevate gridflag loggers, not every third-party library.
+        logging.getLogger("gridflag").setLevel(logging.DEBUG)
 
     if not args.cprofile and not args.lineprof:
         # Default: plain run (debug logging already enabled above if --debug).

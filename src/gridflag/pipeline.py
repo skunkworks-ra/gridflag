@@ -603,9 +603,13 @@ def run(
     n_stat_threads = n_workers
 
     import numba
+    try:
+        layer = numba.threading_layer()
+    except ValueError:
+        layer = "uninitialized"
     log.debug(
         "Numba threading layer: %s  threads: %d",
-        numba.threading_layer(), numba.get_num_threads(),
+        layer, numba.get_num_threads(),
     )
 
     all_flag_rows: list[np.ndarray] = []
