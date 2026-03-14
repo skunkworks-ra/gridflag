@@ -602,6 +602,12 @@ def run(
     # No CASA involvement here, so no reason to cap.
     n_stat_threads = n_workers
 
+    import numba
+    log.debug(
+        "Numba threading layer: %s  threads: %d",
+        numba.threading_layer(), numba.get_num_threads(),
+    )
+
     all_flag_rows: list[np.ndarray] = []
     all_flag_chans: list[np.ndarray] = []
     all_flag_corrs: list[np.ndarray] = []

@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import logging
 import math
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
@@ -235,6 +236,7 @@ def _adaptive_fill_chunk(
     exact_vals_parts: list[NDArray] = []
 
     # Phase 1: parallel I/O — all shards read concurrently, no accumulation yet.
+    _t_io = time.perf_counter()
     with ThreadPoolExecutor(max_workers=n_threads) as pool:
         futs = [
             pool.submit(
@@ -244,8 +246,11 @@ def _adaptive_fill_chunk(
             for sp in shard_paths
         ]
         shard_results = [f.result() for f in futs]
+    log.debug("  fill I/O phase:          %.3fs (%d shards, %d threads)",
+              time.perf_counter() - _t_io, len(shard_paths), n_threads)
 
     # Phase 2: serial accumulation — no thread contention.
+    _t_acc = time.perf_counter()
     for result in shard_results:
         if result is None:
             continue
@@ -296,6 +301,8 @@ def _adaptive_fill_chunk(
         np.clip(bin_idx, 0, n_bins - 1, out=bin_idx)
         combo = chunk_idx_f.astype(np.int64) * n_bins + bin_idx
         hist_ravel += np.bincount(combo, minlength=n_chunk * n_bins).astype(np.int32)
+
+    log.debug("  fill accumulation phase: %.3fs", time.perf_counter() - _t_acc)
 
     all_exact_cidx = np.concatenate(exact_cidx_parts) if exact_cidx_parts else None
     all_exact_vals = np.concatenate(exact_vals_parts) if exact_vals_parts else None
@@ -451,9 +458,11 @@ def compute_cell_stats_streaming(
     n_cells = N_u * N_v
 
     # Pass 0: count discovery.
+    _t0 = time.perf_counter()
     cell_count = pass0_counts(
         shard_paths, spw_key, corr_key, grid_shape, n_threads, threshold_grid,
     )
+    log.debug("Pass0 (count discovery): %.3fs", time.perf_counter() - _t0)
 
     if cell_count.sum() == 0:
         return (
@@ -502,6 +511,7 @@ def compute_cell_stats_streaming(
         cell_to_chunk[chunk_cells] = np.arange(n_chunk, dtype=np.int64)
 
         # Adaptive histogram fill for this chunk.
+        _t_fill = time.perf_counter()
         hist_counts, chunk_lo, chunk_hi, all_exact_cidx, all_exact_vals = (
             _adaptive_fill_chunk(
                 shard_paths, spw_key, corr_key,
@@ -509,14 +519,17 @@ def compute_cell_stats_streaming(
                 chunk_count, n_bins, N_v, n_threads, threshold_grid,
             )
         )
+        log.debug("Chunk %d/%d fill:    %.3fs", chunk_i + 1, n_chunks, time.perf_counter() - _t_fill)
 
         del cell_to_chunk
 
         # Extract stats for this chunk.
+        _t_ext = time.perf_counter()
         medians, stds = _extract_chunk(
             hist_counts, chunk_lo, chunk_hi, chunk_count,
             all_exact_cidx, all_exact_vals, n_bins,
         )
+        log.debug("Chunk %d/%d extract: %.3fs", chunk_i + 1, n_chunks, time.perf_counter() - _t_ext)
 
         # Scatter into output grids.
         median_grid[chunk_cells] = medians
