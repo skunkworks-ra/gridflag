@@ -69,12 +69,26 @@ def _compute_global_N(
 # ── Parallel worker ─────────────────────────────────────────────
 
 
+# ── Persistent pool worker state ────────────────────────────────
+
+_worker_tb = None  # module-level; set once per worker process by _init_worker
+
+
+def _init_worker(ms_path: str) -> None:
+    """Pool initializer: open casatools.table once per worker process."""
+    global _worker_tb
+    import casatools  # type: ignore[import-untyped]
+
+    _worker_tb = casatools.table()
+    _worker_tb.open(ms_path, nomodify=True)
+
+
 def _process_chunk_worker(args: tuple) -> str:
     """Worker: read a row range from the MS, compute UV/cell/quantity, write zarr shard.
 
-    Each worker opens its own casatools.table instance, reads its
-    assigned non-overlapping row range, processes all SPWs/corrs found
-    in that range, and writes flat arrays to its own zarr shard.
+    Each worker uses a persistent casatools.table opened by _init_worker.
+    Reads its assigned non-overlapping row range, processes all SPWs/corrs
+    found in that range, and writes flat arrays to its own zarr shard.
 
     Parameters
     ----------
@@ -104,12 +118,16 @@ def _process_chunk_worker(args: tuple) -> str:
         uv_max,
     ) = args
 
-    import casatools  # type: ignore[import-untyped]
-
     from gridflag.msio import _read_column
 
-    tb = casatools.table()
-    tb.open(ms_path, nomodify=True)
+    # Use persistent worker table if available (pool mode), else open locally.
+    if _worker_tb is not None:
+        tb = _worker_tb
+    else:
+        import casatools  # type: ignore[import-untyped]
+        tb = casatools.table()
+        tb.open(ms_path, nomodify=True)
+    _opened_locally = _worker_tb is None
 
     # Read raw arrays for this row range.
     raw_data = _read_column(tb, data_column, startrow, nrow)
@@ -123,7 +141,8 @@ def _process_chunk_worker(args: tuple) -> str:
     ddid = tb.getcol("DATA_DESC_ID", startrow=startrow, nrow=nrow)
     field_col = tb.getcol("FIELD_ID", startrow=startrow, nrow=nrow)
 
-    tb.close()
+    if _opened_locally:
+        tb.close()
 
     # Absolute row indices for flag write-back.
     abs_rows = np.arange(startrow, startrow + nrow, dtype=np.int64)
@@ -313,6 +332,104 @@ def _flag_shards(
     }
 
 
+# ── Per-(SPW, corr) processing ──────────────────────────────────
+
+
+def _process_spw_corr(
+    group_shards: list[str],
+    spw_id: int,
+    corr: int,
+    gshape: tuple[int, int],
+    config: "GridFlagConfig",
+    n_stat_threads: int,
+    global_N: int,
+    plot_dir: "str | Path | None",
+    persist_cache: bool,
+    store: "ZarrStore",
+) -> dict:
+    """Run stats → thresholds → flags for one (SPW, corr) pair.
+
+    Designed to run concurrently from a ThreadPoolExecutor; all stores
+    go to unique zarr paths so no synchronisation is needed.
+
+    Returns a dict with keys: spw_id, corr, n_total, n_flagged,
+    flag_rows, flag_chans, grid_cache_entry.
+    """
+    spw_key = f"spw_{spw_id}"
+    corr_key = f"corr_{corr}"
+
+    # Streaming statistics.
+    median_grid, std_grid, count_grid = compute_cell_stats_streaming(
+        group_shards, spw_key, corr_key, gshape,
+        n_bins=config.n_bins, n_threads=n_stat_threads,
+    )
+
+    n_total = int(count_grid.sum())
+    log.info("SPW %d corr %d: %d unflagged visibilities", spw_id, corr, n_total)
+
+    store.store_grid(spw_id, corr, "median_grid", median_grid)
+    store.store_grid(spw_id, corr, "std_grid", std_grid)
+    store.store_grid(spw_id, corr, "count_grid", count_grid)
+
+    # Thresholds.
+    local_thr = local_neighborhood_threshold(
+        median_grid, std_grid, count_grid,
+        config.nsigma, config.smoothing_window,
+    )
+    annular_thr = annular_threshold(
+        median_grid, std_grid, count_grid,
+        config.cell_size, config.annulus_widths, config.nsigma, global_N,
+    )
+    threshold_grid = combine_thresholds(
+        local_thr, annular_thr, count_grid,
+        config.smoothing_window, config.min_neighbors,
+    )
+    store.store_grid(spw_id, corr, "threshold_grid", threshold_grid)
+
+    # Streaming flag pass.
+    flag_results = _flag_shards(
+        group_shards, spw_key, corr_key, threshold_grid, n_stat_threads,
+    )
+
+    n_flagged = flag_results["n_flagged"]
+    log.info(
+        "SPW %d corr %d: %d / %d flagged (%.2f%%)",
+        spw_id, corr, n_flagged, n_total,
+        100.0 * n_flagged / max(n_total, 1),
+    )
+
+    store.store_grid(spw_id, corr, "flag_mask", np.zeros(gshape, dtype=np.uint8))
+
+    # Optional "after" grids for plotting / caching.
+    grid_cache_entry = None
+    if (plot_dir is not None or persist_cache) and n_flagged > 0:
+        median_after, std_after, _ = compute_cell_stats_streaming(
+            group_shards, spw_key, corr_key, gshape,
+            n_bins=config.n_bins, n_threads=n_stat_threads,
+            threshold_grid=threshold_grid,
+        )
+        store.store_grid(spw_id, corr, "median_after", median_after)
+        store.store_grid(spw_id, corr, "std_after", std_after)
+
+        if plot_dir is not None:
+            grid_cache_entry = {
+                "median_before": median_grid,
+                "std_before": std_grid,
+                "median_after": median_after,
+                "std_after": std_after,
+            }
+
+    return {
+        "spw_id": spw_id,
+        "corr": corr,
+        "n_total": n_total,
+        "n_flagged": n_flagged,
+        "flag_rows": flag_results["flag_rows"],
+        "flag_chans": flag_results["flag_chans"],
+        "grid_cache_entry": grid_cache_entry,
+    }
+
+
 # ── Main pipeline ───────────────────────────────────────────────
 
 
@@ -459,10 +576,14 @@ def run(
         for i, (startrow, nrow) in enumerate(chunks)
     ]
 
-    # Dispatch workers.
+    # Dispatch workers (persistent table per worker via _init_worker).
     if n_workers > 1:
         ctx = multiprocessing.get_context("spawn")
-        with ctx.Pool(n_workers) as pool:
+        with ctx.Pool(
+            n_workers,
+            initializer=_init_worker,
+            initargs=(ms_path,),
+        ) as pool:
             shard_paths = pool.map(_process_chunk_worker, worker_args)
     else:
         shard_paths = [_process_chunk_worker(a) for a in worker_args]
@@ -487,100 +608,42 @@ def run(
     # For optional plotting.
     grid_cache: dict[tuple[int, int], dict] = {}
 
+    # Build list of (SPW, corr) pairs that have data.
+    all_pairs: list[tuple[list[str], int, int]] = []
     for spw_info in all_spws:
-        spw_id = spw_info["spw_id"]
-        n_corr = spw_info["n_corr"]
-        spw_key = f"spw_{spw_id}"
-
-        for corr in range(n_corr):
-            corr_key = f"corr_{corr}"
-            group_shards = shard_index.get((spw_id, corr), [])
+        spw_id_v = spw_info["spw_id"]
+        for corr in range(spw_info["n_corr"]):
+            group_shards = shard_index.get((spw_id_v, corr), [])
             if not group_shards:
-                log.info("SPW %d corr %d: no data, skipping", spw_id, corr)
-                continue
+                log.info("SPW %d corr %d: no data, skipping", spw_id_v, corr)
+            else:
+                all_pairs.append((group_shards, spw_id_v, corr))
 
-            # Two-pass streaming statistics over shards.
-            median_grid, std_grid, count_grid = compute_cell_stats_streaming(
-                group_shards, spw_key, corr_key, gshape,
-                n_bins=config.n_bins, n_threads=n_stat_threads,
-            )
-
-            n_total = int(count_grid.sum())
-            log.info("SPW %d corr %d: %d unflagged visibilities", spw_id, corr, n_total)
-
-            store.store_grid(spw_id, corr, "median_grid", median_grid)
-            store.store_grid(spw_id, corr, "std_grid", std_grid)
-            store.store_grid(spw_id, corr, "count_grid", count_grid)
-
-            # Thresholds.
-            local_thr = local_neighborhood_threshold(
-                median_grid,
-                std_grid,
-                count_grid,
-                config.nsigma,
-                config.smoothing_window,
-            )
-            annular_thr = annular_threshold(
-                median_grid,
-                std_grid,
-                count_grid,
-                config.cell_size,
-                config.annulus_widths,
-                config.nsigma,
-                global_N,
-            )
-            threshold_grid = combine_thresholds(
-                local_thr,
-                annular_thr,
-                count_grid,
-                config.smoothing_window,
-                config.min_neighbors,
-            )
-            store.store_grid(spw_id, corr, "threshold_grid", threshold_grid)
-
-            # Streaming flag pass: read each shard, flag, collect results.
-            flag_results = _flag_shards(
-                group_shards, spw_key, corr_key, threshold_grid,
-                n_stat_threads,
-            )
-
-            n_flagged = flag_results["n_flagged"]
-            log.info(
-                "SPW %d corr %d: %d / %d flagged (%.2f%%)",
-                spw_id,
-                corr,
-                n_flagged,
-                n_total,
-                100.0 * n_flagged / max(n_total, 1),
-            )
-
-            store.store_grid(spw_id, corr, "flag_mask",
-                             np.zeros(gshape, dtype=np.uint8))
-
-            if (plot_dir is not None or persist_cache) and n_flagged > 0:
-                # Compute "after" grids by streaming with threshold filter.
-                median_after, std_after, _ = compute_cell_stats_streaming(
-                    group_shards, spw_key, corr_key, gshape,
-                    n_bins=config.n_bins, n_threads=n_stat_threads,
-                    threshold_grid=threshold_grid,
+    # Parallelise across (SPW, corr) pairs; cap at 4 to avoid OOM.
+    n_parallel = min(len(all_pairs), 4)
+    if n_parallel > 0:
+        per_pair_threads = max(1, n_stat_threads // n_parallel)
+        with ThreadPoolExecutor(max_workers=n_parallel) as pair_pool:
+            pair_futures = [
+                pair_pool.submit(
+                    _process_spw_corr,
+                    group_shards, spw_id_v, corr, gshape, config,
+                    per_pair_threads, global_N, plot_dir, persist_cache, store,
                 )
-                store.store_grid(spw_id, corr, "median_after", median_after)
-                store.store_grid(spw_id, corr, "std_after", std_after)
-
-                if plot_dir is not None:
-                    grid_cache[(spw_id, corr)] = {
-                        "median_before": median_grid,
-                        "std_before": std_grid,
-                        "median_after": median_after,
-                        "std_after": std_after,
-                    }
-
-            if flag_results["flag_rows"] is not None:
-                all_flag_rows.append(flag_results["flag_rows"])
-                all_flag_chans.append(flag_results["flag_chans"])
-                all_flag_corrs.append(
-                    np.full(n_flagged, corr, dtype=np.int32)
-                )
+                for group_shards, spw_id_v, corr in all_pairs
+            ]
+            for fut in as_completed(pair_futures):
+                result = fut.result()
+                corr = result["corr"]
+                n_flagged = result["n_flagged"]
+                if result["flag_rows"] is not None:
+                    all_flag_rows.append(result["flag_rows"])
+                    all_flag_chans.append(result["flag_chans"])
+                    all_flag_corrs.append(
+                        np.full(n_flagged, corr, dtype=np.int32)
+                    )
+                if result["grid_cache_entry"] is not None:
+                    grid_cache[(result["spw_id"], corr)] = result["grid_cache_entry"]
 
     t_compute = time.monotonic() - t_compute_start
     log.info("Streaming compute + flag: %.1fs", t_compute)

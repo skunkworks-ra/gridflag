@@ -145,6 +145,56 @@ class ZarrStore:
             self.flush(spw_id, corr_id)
 
     # ------------------------------------------------------------------
+    # Streaming append to Zarr (avoids full in-memory concatenation)
+    # ------------------------------------------------------------------
+
+    _FLAT_DTYPES = {
+        "row_indices": "i8",
+        "chan_indices": "i4",
+        "cell_u": "i4",
+        "cell_v": "i4",
+        "values": "f4",
+    }
+
+    def append_direct(
+        self,
+        spw_id: int,
+        corr_id: int,
+        row_indices: NDArray,
+        chan_indices: NDArray,
+        cell_u: NDArray,
+        cell_v: NDArray,
+        values: NDArray,
+    ) -> None:
+        """Append flat arrays directly to resizable Zarr arrays on disk.
+
+        Unlike ``append`` + ``flush``, this never builds a full in-memory
+        concatenation.  Each call extends the on-disk arrays by the length
+        of the incoming batch.
+        """
+        grp = self.root[f"spw_{spw_id}/corr_{corr_id}"]
+        arrays = {
+            "row_indices": row_indices,
+            "chan_indices": chan_indices,
+            "cell_u": cell_u,
+            "cell_v": cell_v,
+            "values": values,
+        }
+        n = len(values)
+        for name, arr in arrays.items():
+            if name not in grp:
+                grp.zeros(
+                    name,
+                    shape=(0,),
+                    chunks=(_FLAT_CHUNK,),
+                    dtype=self._FLAT_DTYPES[name],
+                )
+            za = grp[name]
+            old_len = za.shape[0]
+            za.resize(old_len + n)
+            za[old_len:] = arr
+
+    # ------------------------------------------------------------------
     # Read flat arrays back (pass 1.5)
     # ------------------------------------------------------------------
 

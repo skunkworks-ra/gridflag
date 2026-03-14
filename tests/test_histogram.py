@@ -12,7 +12,7 @@ from gridflag.gridder import compute_cell_stats
 from gridflag.histogram import (
     _EXACT_THRESHOLD,
     compute_cell_stats_streaming,
-    pass1_ranges,
+    pass0_counts,
 )
 
 
@@ -43,7 +43,7 @@ def _write_shard(
     return shard_path
 
 
-class TestPass1Ranges:
+class TestPass0Counts:
     def test_single_shard(self, rng):
         with tempfile.TemporaryDirectory() as td:
             td_path = Path(td)
@@ -53,13 +53,9 @@ class TestPass1Ranges:
             sp = _write_shard(td_path, "s0", 0, 0, cell_u, cell_v, values)
 
             grid_shape = (2, 2)
-            cmin, cmax, ccount = pass1_ranges(
-                [sp], "spw_0", "corr_0", grid_shape, n_threads=1
-            )
+            ccount = pass0_counts([sp], "spw_0", "corr_0", grid_shape, n_threads=1)
             assert ccount[0 * 2 + 0] == 2  # cell (0,0)
             assert ccount[1 * 2 + 1] == 1  # cell (1,1)
-            assert cmin[0] == 1.0
-            assert cmax[0] == 5.0
 
     def test_two_shards_reduce(self):
         with tempfile.TemporaryDirectory() as td:
@@ -77,12 +73,8 @@ class TestPass1Ranges:
                 np.array([2.0], dtype=np.float32),
             )
 
-            cmin, cmax, ccount = pass1_ranges(
-                [sp1, sp2], "spw_0", "corr_0", (1, 1), n_threads=2
-            )
+            ccount = pass0_counts([sp1, sp2], "spw_0", "corr_0", (1, 1), n_threads=2)
             assert ccount[0] == 2
-            assert cmin[0] == 2.0
-            assert cmax[0] == 10.0
 
     def test_missing_group_skipped(self):
         with tempfile.TemporaryDirectory() as td:
@@ -94,9 +86,7 @@ class TestPass1Ranges:
                 np.array([1.0], dtype=np.float32),
             )
             # Ask for a different (spw, corr) → should return zeros.
-            _, _, ccount = pass1_ranges(
-                [sp], "spw_1", "corr_0", (1, 1), n_threads=1
-            )
+            ccount = pass0_counts([sp], "spw_1", "corr_0", (1, 1), n_threads=1)
             assert ccount[0] == 0
 
 
@@ -348,3 +338,80 @@ class TestEdgeCases:
             assert med.dtype == np.float32
             assert std.dtype == np.float32
             assert cnt.dtype == np.int32
+
+
+class TestAdaptiveRebin:
+    """Verify adaptive range expansion + rebinning across shards."""
+
+    def test_range_expansion_across_shards(self):
+        """Second shard extends the value range, triggering histogram rebin."""
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            rng = np.random.default_rng(0)
+
+            # Shard 1: 100 values in narrow range [2, 4].
+            vals1 = rng.uniform(2.0, 4.0, size=100).astype(np.float32)
+            sp1 = _write_shard(
+                td_path, "s0", 0, 0,
+                np.zeros(100, dtype=np.int32),
+                np.zeros(100, dtype=np.int32),
+                vals1,
+            )
+
+            # Shard 2: 100 values extending the range to [0, 8].
+            vals2 = rng.uniform(0.0, 8.0, size=100).astype(np.float32)
+            sp2 = _write_shard(
+                td_path, "s1", 0, 0,
+                np.zeros(100, dtype=np.int32),
+                np.zeros(100, dtype=np.int32),
+                vals2,
+            )
+
+            med, std, cnt = compute_cell_stats_streaming(
+                [sp1, sp2], "spw_0", "corr_0", (1, 1), n_bins=256, n_threads=2,
+            )
+
+            assert cnt[0, 0] == 200
+
+            # Reference via exact computation.
+            all_vals = np.concatenate([vals1, vals2])
+            med_ref, std_ref, _ = compute_cell_stats(
+                np.zeros(200, dtype=np.intp),
+                np.zeros(200, dtype=np.intp),
+                all_vals, (1, 1),
+            )
+
+            np.testing.assert_allclose(med[0, 0], med_ref[0, 0], rtol=0.05)
+            # Adaptive rebin introduces additional approximation when shard ranges
+            # differ significantly; allow slightly looser tolerance for std.
+            np.testing.assert_allclose(std[0, 0], std_ref[0, 0], rtol=0.10)
+
+    def test_rebin_order_independent(self):
+        """Results are the same regardless of which shard arrives first."""
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            rng = np.random.default_rng(7)
+
+            vals1 = rng.uniform(0.0, 10.0, size=50).astype(np.float32)
+            vals2 = rng.uniform(-5.0, 15.0, size=50).astype(np.float32)
+            sp1 = _write_shard(
+                td_path, "s0", 0, 0,
+                np.zeros(50, dtype=np.int32), np.zeros(50, dtype=np.int32), vals1,
+            )
+            sp2 = _write_shard(
+                td_path, "s1", 0, 0,
+                np.zeros(50, dtype=np.int32), np.zeros(50, dtype=np.int32), vals2,
+            )
+
+            # Both orderings should produce the same count.
+            med_ab, std_ab, cnt_ab = compute_cell_stats_streaming(
+                [sp1, sp2], "spw_0", "corr_0", (1, 1), n_bins=256, n_threads=1,
+            )
+            med_ba, std_ba, cnt_ba = compute_cell_stats_streaming(
+                [sp2, sp1], "spw_0", "corr_0", (1, 1), n_bins=256, n_threads=1,
+            )
+
+            assert cnt_ab[0, 0] == cnt_ba[0, 0] == 100
+            # Medians and stds agree within histogram tolerance.
+            np.testing.assert_allclose(med_ab[0, 0], med_ba[0, 0], rtol=0.01)
+            np.testing.assert_allclose(std_ab[0, 0], std_ba[0, 0], rtol=0.01)
