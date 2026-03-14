@@ -17,8 +17,7 @@ class GridFlagConfig:
     data_column: str = "auto"  # auto | DATA | CORRECTED_DATA | RESIDUAL
     quantity: str = "amplitude"  # amplitude | phase | real | imag
     zarr_path: str | None = None  # None → tempdir
-    chunk_size: int = 50_000  # rows per read chunk
-    n_readers: int = 4
+    n_workers: int = 0  # 0 = auto (cpu_count)
     min_neighbors: int = 3  # fallback to annular if fewer
     spw_ids: tuple[int, ...] | None = None
     field_ids: tuple[int, ...] | None = None

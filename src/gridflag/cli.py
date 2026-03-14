@@ -31,9 +31,11 @@ CONTEXT_SETTINGS = dict(help_option_names=["-h", "--help"])
 @click.option(
     "--zarr-path", default=None, show_default=True, help="Path for Zarr store (default: tempdir)."
 )
-@click.option("--chunk-size", default=50_000, show_default=True, help="Rows per MS read chunk.")
 @click.option(
-    "--n-readers", default=4, show_default=True, help="Number of parallel reader processes."
+    "--n-workers",
+    default=0,
+    show_default=True,
+    help="Number of parallel reader processes (0 = auto).",
 )
 @click.option(
     "--min-neighbors",
@@ -72,8 +74,7 @@ def main(
     data_column: str,
     quantity: str,
     zarr_path: str | None,
-    chunk_size: int,
-    n_readers: int,
+    n_workers: int,
     uvrange: str | None,
     min_neighbors: int,
     spw_ids: tuple[int, ...],
@@ -102,8 +103,7 @@ def main(
         data_column=data_column,
         quantity=quantity,
         zarr_path=zarr_path,
-        chunk_size=chunk_size,
-        n_readers=n_readers,
+        n_workers=n_workers,
         min_neighbors=min_neighbors,
         spw_ids=spw_ids or None,
         field_ids=field_ids or None,

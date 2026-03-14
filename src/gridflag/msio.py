@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from collections.abc import Iterator
 from dataclasses import dataclass
 
@@ -10,6 +11,14 @@ import numpy as np
 from numpy.typing import NDArray
 
 log = logging.getLogger("gridflag.msio")
+
+
+def available_cpus() -> int:
+    """Return the number of CPUs available to this process (cgroups-aware)."""
+    try:
+        return len(os.sched_getaffinity(0))
+    except AttributeError:
+        return os.cpu_count() or 1
 
 
 @dataclass
@@ -89,6 +98,64 @@ def _read_column(tb, col_spec: str, startrow: int, nrow: int) -> NDArray:
         return tb.getcol(col_spec, startrow=startrow, nrow=nrow)
 
 
+# ── Row-range chunking (parallel reads) ─────────────────────────
+
+
+def compute_row_chunks(ms_path: str, nchunks: int) -> list[tuple[int, int]]:
+    """Compute non-overlapping (startrow, nrow) ranges respecting integration boundaries.
+
+    Reads the TIME column once, finds unique time-step boundaries, and
+    distributes them evenly across *nchunks* chunks so that no
+    integration is split across workers.
+    """
+    casatools = _import_casatools()
+    tb = casatools.table()
+    tb.open(ms_path, nomodify=True)
+    time_col = tb.getcol("TIME")
+    total_rows = tb.nrows()
+    tb.close()
+
+    unique_times, first_indices = np.unique(time_col, return_index=True)
+    n_times = len(unique_times)
+
+    sorted_indices = np.argsort(first_indices)
+
+    if n_times <= nchunks:
+        # More chunks than time steps — one chunk per time step.
+        chunks = []
+        for i, idx in enumerate(sorted_indices):
+            start = first_indices[idx]
+            if i + 1 < len(sorted_indices):
+                end = first_indices[sorted_indices[i + 1]]
+            else:
+                end = total_rows
+            chunks.append((int(start), int(end - start)))
+        return chunks
+
+    # Distribute time steps evenly across chunks.
+    times_per_chunk = n_times // nchunks
+    chunks = []
+    for w in range(nchunks):
+        start_time_idx = w * times_per_chunk
+        if w == nchunks - 1:
+            end_time_idx = n_times
+        else:
+            end_time_idx = (w + 1) * times_per_chunk
+
+        startrow = first_indices[sorted_indices[start_time_idx]]
+        if end_time_idx >= n_times:
+            endrow = total_rows
+        else:
+            endrow = first_indices[sorted_indices[end_time_idx]]
+
+        chunks.append((int(startrow), int(endrow - startrow)))
+
+    return chunks
+
+
+# ── Legacy sequential reader ────────────────────────────────────
+
+
 def read_chunks(
     ms_path: str,
     data_column: str,
@@ -141,6 +208,9 @@ def read_chunks(
         tb.close()
 
 
+# ── Metadata helpers ────────────────────────────────────────────
+
+
 def get_max_baseline_m(ms_path: str) -> float:
     """Return the maximum baseline length in metres from the ANTENNA table."""
     casatools = _import_casatools()
@@ -185,6 +255,9 @@ def get_spw_info(ms_path: str) -> list[dict]:
         s["n_corr"] = n_corr
 
     return spws
+
+
+# ── Flag writing ────────────────────────────────────────────────
 
 
 def write_flags(

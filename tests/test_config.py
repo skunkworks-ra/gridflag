@@ -16,6 +16,7 @@ class TestGridFlagConfig:
         assert c.data_column == "auto"
         assert c.quantity == "amplitude"
         assert c.zarr_path is None
+        assert c.n_workers == 0
         assert c.spw_ids is None
         assert c.field_ids is None
         assert c.uvrange is None

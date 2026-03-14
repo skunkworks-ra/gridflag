@@ -26,8 +26,7 @@ def gridflag(
     data_column: str = "auto",
     quantity: str = "amplitude",
     zarr_path: str | None = None,
-    chunk_size: int = 50_000,
-    n_readers: int = 4,
+    n_workers: int = 0,
     min_neighbors: int = 3,
     spw_ids: tuple[int, ...] | None = None,
     field_ids: tuple[int, ...] | None = None,
@@ -60,10 +59,8 @@ def gridflag(
         Visibility quantity to threshold (amplitude | phase | real | imag).
     zarr_path : str or None
         Path for Zarr intermediate store.  None uses a tempdir.
-    chunk_size : int
-        Rows per MS read chunk.
-    n_readers : int
-        Number of parallel reader processes.
+    n_workers : int
+        Number of parallel reader processes (0 = auto).
     min_neighbors : int
         Minimum occupied neighbors for local threshold; fewer falls back
         to annular.
@@ -98,8 +95,7 @@ def gridflag(
         data_column=data_column,
         quantity=quantity,
         zarr_path=zarr_path,
-        chunk_size=chunk_size,
-        n_readers=n_readers,
+        n_workers=n_workers,
         min_neighbors=min_neighbors,
         spw_ids=spw_ids,
         field_ids=field_ids,

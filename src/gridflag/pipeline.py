@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import logging
+import multiprocessing
 import shutil
 import time
 import uuid
 from pathlib import Path
 
 import numpy as np
+import zarr
 
 from gridflag.config import GridFlagConfig
 from gridflag.coordinates import (
@@ -18,9 +20,10 @@ from gridflag.coordinates import (
 from gridflag.flagger import flag_visibilities
 from gridflag.gridder import compute_cell_stats
 from gridflag.msio import (
+    available_cpus,
+    compute_row_chunks,
     get_max_baseline_m,
     get_spw_info,
-    read_chunks,
     resolve_data_column,
     write_flags_batched,
 )
@@ -60,6 +63,164 @@ def _compute_global_N(
     return int(np.ceil(uv_max / cell_size))
 
 
+# ── Parallel worker ─────────────────────────────────────────────
+
+
+def _process_chunk_worker(args: tuple) -> str:
+    """Worker: read a row range from the MS, compute UV/cell/quantity, write zarr shard.
+
+    Each worker opens its own casatools.table instance, reads its
+    assigned non-overlapping row range, processes all SPWs/corrs found
+    in that range, and writes flat arrays to its own zarr shard.
+
+    Parameters
+    ----------
+    args : tuple
+        (ms_path, data_column, startrow, nrow, chunk_index, shard_dir,
+         spw_lookup, global_N, cell_size, quantity, field_ids,
+         uv_min, uv_max)
+
+    Returns
+    -------
+    str
+        Path to the written zarr shard.
+    """
+    (
+        ms_path,
+        data_column,
+        startrow,
+        nrow,
+        chunk_index,
+        shard_dir,
+        spw_lookup,
+        global_N,
+        cell_size,
+        quantity,
+        field_ids,
+        uv_min,
+        uv_max,
+    ) = args
+
+    import casatools  # type: ignore[import-untyped]
+
+    from gridflag.msio import _read_column
+
+    tb = casatools.table()
+    tb.open(ms_path, nomodify=True)
+
+    # Read raw arrays for this row range.
+    raw_data = _read_column(tb, data_column, startrow, nrow)
+    # casatools returns (n_corr, n_chan, n_row)
+    data = raw_data.transpose(2, 1, 0)  # → (n_row, n_chan, n_corr)
+
+    flags_raw = tb.getcol("FLAG", startrow=startrow, nrow=nrow)
+    flags = flags_raw.transpose(2, 1, 0).astype(bool)
+
+    uvw = tb.getcol("UVW", startrow=startrow, nrow=nrow).T  # → (n_row, 3)
+    ddid = tb.getcol("DATA_DESC_ID", startrow=startrow, nrow=nrow)
+    field_col = tb.getcol("FIELD_ID", startrow=startrow, nrow=nrow)
+
+    tb.close()
+
+    # Absolute row indices for flag write-back.
+    abs_rows = np.arange(startrow, startrow + nrow, dtype=np.int64)
+
+    # Open a zarr shard for this chunk.
+    shard_path = str(Path(shard_dir) / f"chunk_{chunk_index}.zarr")
+    root = zarr.open(shard_path, mode="w")
+
+    has_uv_filter = uv_min > 0 or uv_max < np.inf
+
+    # Process each SPW present in this row range.
+    unique_ddids = np.unique(ddid)
+    for spw_id_val in unique_ddids:
+        spw_id = int(spw_id_val)
+        if spw_id not in spw_lookup:
+            continue
+
+        spw_info = spw_lookup[spw_id]
+        n_corr = spw_info["n_corr"]
+        chan_freqs = np.array(spw_info["chan_freqs"])
+        freq_over_c = chan_freqs / C_M_S
+        n_chan = len(chan_freqs)
+
+        # Select rows for this SPW.
+        spw_mask = ddid == spw_id
+        spw_data = data[spw_mask]
+        spw_flags = flags[spw_mask]
+        spw_uvw = uvw[spw_mask]
+        spw_abs_rows = abs_rows[spw_mask]
+        spw_fields = field_col[spw_mask]
+
+        # Field filter.
+        if field_ids is not None:
+            field_keep = np.isin(spw_fields, field_ids)
+            if not np.any(field_keep):
+                continue
+            spw_data = spw_data[field_keep]
+            spw_flags = spw_flags[field_keep]
+            spw_uvw = spw_uvw[field_keep]
+            spw_abs_rows = spw_abs_rows[field_keep]
+
+        n_row_spw = spw_data.shape[0]
+
+        # Per-channel UV in wavelengths: (n_row, n_chan).
+        u_ch = spw_uvw[:, 0:1] * freq_over_c[np.newaxis, :]
+        v_ch = spw_uvw[:, 1:2] * freq_over_c[np.newaxis, :]
+
+        # Hermitian fold.
+        neg = v_ch < 0
+        u_ch[neg] = -u_ch[neg]
+        v_ch[neg] = -v_ch[neg]
+
+        # Cell assignment.
+        cell_u = np.rint(u_ch / cell_size).astype(np.int32) + global_N
+        cell_v = np.rint(v_ch / cell_size).astype(np.int32)
+
+        # UV distance filter.
+        if has_uv_filter:
+            uv_dist_sq = u_ch * u_ch + v_ch * v_ch
+            uv_keep = (uv_dist_sq >= uv_min * uv_min) & (uv_dist_sq <= uv_max * uv_max)
+        else:
+            uv_keep = None
+
+        # Pre-flatten shared arrays.
+        cell_u_flat = cell_u.ravel()
+        cell_v_flat = cell_v.ravel()
+        row_idx = np.repeat(spw_abs_rows, n_chan)
+        chan_idx = np.tile(np.arange(n_chan, dtype=np.int32), n_row_spw)
+
+        for corr in range(n_corr):
+            vis_corr = spw_data[:, :, corr]
+            has_neg = np.any(neg)
+            if has_neg:
+                vis_corr = vis_corr.copy()
+                vis_corr[neg] = np.conj(vis_corr[neg])
+
+            vals = _extract_quantity(vis_corr, quantity).ravel()
+            flag_corr = spw_flags[:, :, corr].ravel()
+
+            keep = ~flag_corr
+            if uv_keep is not None:
+                keep = keep & uv_keep.ravel()
+
+            if not np.any(keep):
+                continue
+
+            # Write flat arrays to zarr shard.
+            grp = root.require_group(f"spw_{spw_id}/corr_{corr}")
+            grp.array("row_indices", row_idx[keep], overwrite=True)
+            grp.array("chan_indices", chan_idx[keep], overwrite=True)
+            grp.array("cell_u", cell_u_flat[keep], overwrite=True)
+            grp.array("cell_v", cell_v_flat[keep], overwrite=True)
+            grp.array("values", vals[keep], overwrite=True)
+
+    return shard_path
+
+
+# ── Main pipeline ───────────────────────────────────────────────
+
+
 def run(
     ms_path: str,
     config: GridFlagConfig | None = None,
@@ -77,10 +238,11 @@ def run(
         Default is False (clean up).
 
     Data flow:
-      1. Read MS in chunks → compute UV coords, cell indices → accumulate
-         flat arrays in memory, flush once to Zarr per (spw, corr)
-      2. Per (SPW, corr): load from Zarr → cell stats → thresholds → flags
-      3. Batch-write flags back to MS
+      1. Parallel read MS → compute UV coords, cell indices → each worker
+         writes its own zarr shard
+      2. Collect shards into main ZarrStore
+      3. Per (SPW, corr): load from Zarr → cell stats → thresholds → flags
+      4. Batch-write flags back to MS
     """
     if config is None:
         config = GridFlagConfig()
@@ -98,6 +260,17 @@ def run(
         all_spws = [s for s in all_spws if s["spw_id"] in config.spw_ids]
     log.info("Processing %d SPW(s)", len(all_spws))
 
+    # Build SPW lookup for workers (must be picklable).
+    spw_lookup = {
+        s["spw_id"]: {
+            "n_chan": s["n_chan"],
+            "n_corr": s["n_corr"],
+            "ref_freq": s["ref_freq"],
+            "chan_freqs": s["chan_freqs"].tolist(),
+        }
+        for s in all_spws
+    }
+
     # Determine global grid size.
     if config.uvrange is not None:
         uv_min, uv_max = config.uvrange
@@ -106,7 +279,7 @@ def run(
     else:
         uv_min = 0.0
         global_N = _compute_global_N(ms_path, all_spws, config.cell_size)
-        uv_max = global_N * config.cell_size
+        uv_max = float(global_N * config.cell_size)
     gshape = grid_shape(global_N)
     log.info("Grid shape: %s  (N=%d)", gshape, global_N)
 
@@ -121,94 +294,95 @@ def run(
     store.set_grid_shape(gshape)
     log.info("Zarr store: %s", zarr_path)
 
-    # ── Pass 1: Read MS → accumulate → flush to Zarr ────────────────
-    t_read_start = time.monotonic()
-
+    # Initialise SPW groups in the store.
     for spw_info in all_spws:
-        spw_id = spw_info["spw_id"]
-        n_chan = spw_info["n_chan"]
-        n_corr = spw_info["n_corr"]
-        ref_freq = spw_info["ref_freq"]
-        chan_freqs = np.array(spw_info["chan_freqs"])
-        freq_over_c = chan_freqs / C_M_S  # precompute (n_chan,)
-
-        store.init_spw(spw_id, n_chan, n_corr, ref_freq, chan_freqs)
-        log.info(
-            "SPW %d: %d chan, %d corr, ref_freq=%.3f MHz",
-            spw_id,
-            n_chan,
-            n_corr,
-            ref_freq / 1e6,
+        store.init_spw(
+            spw_info["spw_id"],
+            spw_info["n_chan"],
+            spw_info["n_corr"],
+            spw_info["ref_freq"],
+            np.array(spw_info["chan_freqs"]),
         )
 
-        for chunk in read_chunks(ms_path, data_column, config.chunk_size, spw_id):
-            if config.field_ids is not None and chunk.field_id not in config.field_ids:
-                continue
+    # ── Pass 1: Parallel read MS → zarr shards ─────────────────────
+    t_read_start = time.monotonic()
 
-            n_row = chunk.data.shape[0]
-            uvw = chunk.uvw  # (n_row, 3)
+    n_workers = config.n_workers if config.n_workers > 0 else available_cpus()
+    n_workers = min(n_workers, 8)  # cap at 8 to avoid CASA lock contention
 
-            # Per-channel UV in wavelengths: (n_row, n_chan).
-            u_ch = uvw[:, 0:1] * freq_over_c[np.newaxis, :]
-            v_ch = uvw[:, 1:2] * freq_over_c[np.newaxis, :]
+    # Compute non-overlapping row chunks.
+    chunks = compute_row_chunks(ms_path, max(n_workers, 1))
+    log.info(
+        "Reading %d chunks with %d workers",
+        len(chunks),
+        n_workers,
+    )
 
-            # Hermitian fold (in-place on our local arrays).
-            neg = v_ch < 0
-            u_ch[neg] = -u_ch[neg]
-            v_ch[neg] = -v_ch[neg]
-            # vis conjugation handled per-corr below.
+    # Temp directory for zarr shards (alongside main store).
+    shard_dir = str(zarr_path.parent / f"tmp_gridflag_shards_{uuid.uuid4().hex[:8]}")
+    Path(shard_dir).mkdir(parents=True, exist_ok=True)
 
-            # Cell assignment with global N.
-            cell_u = np.rint(u_ch / config.cell_size).astype(np.int32) + global_N
-            cell_v = np.rint(v_ch / config.cell_size).astype(np.int32)
+    # Build worker args.
+    field_ids_list = list(config.field_ids) if config.field_ids is not None else None
+    worker_args = [
+        (
+            ms_path,
+            data_column,
+            startrow,
+            nrow,
+            i,
+            shard_dir,
+            spw_lookup,
+            global_N,
+            config.cell_size,
+            config.quantity,
+            field_ids_list,
+            uv_min,
+            uv_max if config.uvrange is not None else float("inf"),
+        )
+        for i, (startrow, nrow) in enumerate(chunks)
+    ]
 
-            # UV distance filter.
-            if uv_min > 0 or config.uvrange is not None:
-                uv_dist_sq = u_ch * u_ch + v_ch * v_ch
-                uv_keep = (uv_dist_sq >= uv_min * uv_min) & (uv_dist_sq <= uv_max * uv_max)
-            else:
-                uv_keep = None
-
-            # Pre-flatten shared arrays (computed once, used per corr).
-            cell_u_flat = cell_u.ravel()
-            cell_v_flat = cell_v.ravel()
-            row_idx = np.repeat(chunk.row_indices, n_chan)
-            chan_idx = np.tile(np.arange(n_chan, dtype=np.int32), n_row)
-
-            for corr in range(n_corr):
-                vis_corr = chunk.data[:, :, corr]  # (n_row, n_chan) complex
-                # Conjugate where v was negative.
-                has_neg = np.any(neg)
-                if has_neg:
-                    vis_corr = vis_corr.copy()
-                    vis_corr[neg] = np.conj(vis_corr[neg])
-
-                vals = _extract_quantity(vis_corr, config.quantity).ravel()
-                flag_corr = chunk.flags[:, :, corr].ravel()
-
-                # Combined keep mask.
-                keep = ~flag_corr
-                if uv_keep is not None:
-                    keep = keep & uv_keep.ravel()
-
-                if not np.any(keep):
-                    continue
-
-                store.append(
-                    spw_id,
-                    corr,
-                    row_idx[keep],
-                    chan_idx[keep],
-                    cell_u_flat[keep],
-                    cell_v_flat[keep],
-                    vals[keep],
-                )
-
-    # Flush all accumulated data to Zarr.
-    store.flush_all()
+    # Dispatch workers.
+    if n_workers > 1:
+        ctx = multiprocessing.get_context("spawn")
+        with ctx.Pool(n_workers) as pool:
+            shard_paths = pool.map(_process_chunk_worker, worker_args)
+    else:
+        shard_paths = [_process_chunk_worker(a) for a in worker_args]
 
     t_read = time.monotonic() - t_read_start
-    log.info("Read + accumulate: %.1fs", t_read)
+    log.info("Parallel read + compute: %.1fs (%d workers)", t_read, n_workers)
+
+    # ── Collect shards into main ZarrStore ──────────────────────────
+    t_collect_start = time.monotonic()
+
+    for shard_path in shard_paths:
+        shard_root = zarr.open(shard_path, mode="r")
+        for spw_key in shard_root:
+            spw_id = int(spw_key.split("_")[1])
+            spw_grp = shard_root[spw_key]
+            for corr_key in spw_grp:
+                corr_id = int(corr_key.split("_")[1])
+                cgrp = spw_grp[corr_key]
+                store.append(
+                    spw_id,
+                    corr_id,
+                    cgrp["row_indices"][:],
+                    cgrp["chan_indices"][:],
+                    cgrp["cell_u"][:],
+                    cgrp["cell_v"][:],
+                    cgrp["values"][:],
+                )
+
+    # Flush all accumulated data to main Zarr.
+    store.flush_all()
+
+    # Clean up shards.
+    shutil.rmtree(shard_dir, ignore_errors=True)
+
+    t_collect = time.monotonic() - t_collect_start
+    log.info("Shard collection: %.1fs", t_collect)
 
     # ── Pass 1.5: Compute statistics, thresholds, flags ─────────────
     t_compute_start = time.monotonic()
