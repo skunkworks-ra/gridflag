@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import logging
-import tempfile
 import time
+import uuid
 from pathlib import Path
 
 import numpy as np
@@ -104,7 +104,8 @@ def run(
     if config.zarr_path is not None:
         zarr_path = Path(config.zarr_path)
     else:
-        zarr_path = Path(tempfile.mkdtemp(prefix="gridflag_")) / "store.zarr"
+        uid = uuid.uuid4().hex[:8]
+        zarr_path = Path.cwd() / f"tmp_gridflag_uv_{uid}.zarr"
     store = ZarrStore(zarr_path, config, ms_path)
     store.set_grid_shape(gshape)
     log.info("Zarr store: %s", zarr_path)
