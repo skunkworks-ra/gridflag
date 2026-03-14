@@ -142,6 +142,75 @@ def _rebin_histogram(
     return new_hist
 
 
+@njit(cache=True)
+def _accumulate_shard_jit(
+    chunk_idx_f: np.ndarray,
+    values_f: np.ndarray,
+    occ_lo: np.ndarray,
+    occ_hi: np.ndarray,
+    initialized: np.ndarray,
+    hist_counts: np.ndarray,
+    n_bins: int,
+) -> None:
+    """JIT accumulation for one shard: range update + histogram fill.
+
+    Pass 1 — per-cell range update (replaces np.unique / minimum.at /
+              maximum.at / Python for-loop).
+    Pass 2 — histogram fill (replaces np.bincount + hist_ravel +=).
+
+    hist_counts is (n_chunk, n_bins) int32, modified in-place.
+    """
+    n = len(values_f)
+    n_chunk = occ_lo.shape[0]
+
+    # --- Pass 1a: scatter min/max into per-cell accumulators ---------------
+    batch_lo = np.full(n_chunk, np.inf)
+    batch_hi = np.full(n_chunk, -np.inf)
+    for i in range(n):
+        ci = chunk_idx_f[i]
+        v = values_f[i]
+        if v < batch_lo[ci]:
+            batch_lo[ci] = v
+        if v > batch_hi[ci]:
+            batch_hi[ci] = v
+
+    # --- Pass 1b: compare against stored range, rebin where expanded -------
+    for ci in range(n_chunk):
+        b_lo = batch_lo[ci]
+        if b_lo == np.inf:          # cell not present in this shard
+            continue
+        b_hi = batch_hi[ci]
+        if not initialized[ci]:
+            occ_lo[ci] = b_lo
+            occ_hi[ci] = b_hi if b_hi > b_lo else b_lo + 1.0
+            initialized[ci] = True
+        else:
+            new_lo = occ_lo[ci] if occ_lo[ci] < b_lo else b_lo
+            new_hi = occ_hi[ci] if occ_hi[ci] > b_hi else b_hi
+            if new_lo < occ_lo[ci] or new_hi > occ_hi[ci]:
+                hi_safe = new_hi if new_hi > new_lo else new_lo + 1.0
+                hist_counts[ci] = _rebin_histogram(
+                    hist_counts[ci],
+                    occ_lo[ci], occ_hi[ci],
+                    new_lo, hi_safe,
+                    n_bins,
+                )
+                occ_lo[ci] = new_lo
+                occ_hi[ci] = hi_safe
+
+    # --- Pass 2: fill histogram bins ----------------------------------------
+    for i in range(n):
+        ci = chunk_idx_f[i]
+        lo = occ_lo[ci]
+        rng = occ_hi[ci] - lo
+        b = int((values_f[i] - lo) / rng * n_bins)
+        if b < 0:
+            b = 0
+        elif b >= n_bins:
+            b = n_bins - 1
+        hist_counts[ci, b] += 1
+
+
 def _read_raw_shard(
     shard_path: str,
     spw_key: str,
@@ -226,7 +295,6 @@ def _adaptive_fill_chunk(
     """
     n_chunk = len(chunk_cells)
     hist_counts = np.zeros((n_chunk, n_bins), dtype=np.int32)
-    hist_ravel = hist_counts.ravel()
     occ_lo = np.full(n_chunk, np.inf, dtype=np.float64)
     occ_hi = np.full(n_chunk, -np.inf, dtype=np.float64)
     initialized = np.zeros(n_chunk, dtype=np.bool_)
@@ -261,46 +329,12 @@ def _adaptive_fill_chunk(
             exact_cidx_parts.append(exact_ci)
             exact_vals_parts.append(exact_v)
 
-        # Per-cell min/max for this batch.
-        unique_ci, inv = np.unique(chunk_idx_f, return_inverse=True)
-        batch_lo = np.full(len(unique_ci), np.inf)
-        batch_hi = np.full(len(unique_ci), -np.inf)
-        np.minimum.at(batch_lo, inv, values_f)
-        np.maximum.at(batch_hi, inv, values_f)
-
-        # Update per-cell ranges; rebin if an existing range expands.
-        # Rebin events are rare (only when a later shard extends the range).
-        for k in range(len(unique_ci)):
-            ci = int(unique_ci[k])
-            b_lo = float(batch_lo[k])
-            b_hi = float(batch_hi[k])
-            if not initialized[ci]:
-                occ_lo[ci] = b_lo
-                # Ensure non-zero width for constant-value cells.
-                occ_hi[ci] = b_hi if b_hi > b_lo else b_lo + 1.0
-                initialized[ci] = True
-            else:
-                new_lo = min(occ_lo[ci], b_lo)
-                new_hi = max(occ_hi[ci], b_hi)
-                if new_lo < occ_lo[ci] or new_hi > occ_hi[ci]:
-                    hi_safe = new_hi if new_hi > new_lo else new_lo + 1.0
-                    hist_counts[ci] = _rebin_histogram(
-                        hist_counts[ci],
-                        occ_lo[ci], occ_hi[ci],
-                        new_lo, hi_safe,
-                        n_bins,
-                    )
-                    occ_lo[ci] = new_lo
-                    occ_hi[ci] = hi_safe
-
-        # Vectorized histogram binning for this shard's batch.
-        lo_f = occ_lo[chunk_idx_f]
-        range_f = occ_hi[chunk_idx_f] - lo_f
-        normalised = (values_f - lo_f) / range_f
-        bin_idx = np.floor(normalised * n_bins).astype(np.int64)
-        np.clip(bin_idx, 0, n_bins - 1, out=bin_idx)
-        combo = chunk_idx_f.astype(np.int64) * n_bins + bin_idx
-        hist_ravel += np.bincount(combo, minlength=n_chunk * n_bins).astype(np.int32)
+        # JIT kernel: range update + histogram fill in two tight loops.
+        _accumulate_shard_jit(
+            chunk_idx_f, values_f,
+            occ_lo, occ_hi, initialized,
+            hist_counts, n_bins,
+        )
 
     log.debug("  fill accumulation phase: %.3fs", time.perf_counter() - _t_acc)
 
