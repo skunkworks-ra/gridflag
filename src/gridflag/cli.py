@@ -12,37 +12,58 @@ CONTEXT_SETTINGS = dict(help_option_names=["-h", "--help"])
 
 @click.command(context_settings=CONTEXT_SETTINGS)
 @click.argument("ms_path", type=click.Path(exists=True))
-@click.option("--cell-size", default=10.0, show_default=True,
-              help="Grid cell size in lambda.")
-@click.option("--nsigma", default=3.0, show_default=True,
-              help="Sigma threshold multiplier.")
-@click.option("--smoothing-window", default=5, show_default=True,
-              help="Neighborhood kernel size.")
-@click.option("--data-column", default="auto", show_default=True,
-              help="Data column (auto | DATA | CORRECTED_DATA | RESIDUAL).")
-@click.option("--quantity", default="amplitude", show_default=True,
-              type=click.Choice(["amplitude", "phase", "real", "imag"]),
-              help="Quantity to threshold on.")
-@click.option("--zarr-path", default=None, show_default=True,
-              help="Path for Zarr store (default: tempdir).")
-@click.option("--chunk-size", default=50_000, show_default=True,
-              help="Rows per MS read chunk.")
-@click.option("--n-readers", default=4, show_default=True,
-              help="Number of parallel reader processes.")
-@click.option("--min-neighbors", default=3, show_default=True,
-              help="Min occupied neighbors for local threshold.")
-@click.option("--uvrange", default=None,
-              help="UV range in lambda as UVMIN,UVMAX (e.g. 100,50000).")
-@click.option("--spw", "spw_ids", multiple=True, type=int,
-              help="SPW IDs to process (repeatable).")
-@click.option("--field", "field_ids", multiple=True, type=int,
-              help="Field IDs to process (repeatable).")
-@click.option("--plot-dir", default=None, type=click.Path(),
-              help="Directory for before/after diagnostic plots.")
-@click.option("--persist-cache", is_flag=True, default=False,
-              help="Keep the Zarr intermediate store after the run.")
-@click.option("--log-level", default="INFO", show_default=True,
-              type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR"]))
+@click.option("--cell-size", default=10.0, show_default=True, help="Grid cell size in lambda.")
+@click.option("--nsigma", default=3.0, show_default=True, help="Sigma threshold multiplier.")
+@click.option("--smoothing-window", default=5, show_default=True, help="Neighborhood kernel size.")
+@click.option(
+    "--data-column",
+    default="auto",
+    show_default=True,
+    help="Data column (auto | DATA | CORRECTED_DATA | RESIDUAL).",
+)
+@click.option(
+    "--quantity",
+    default="amplitude",
+    show_default=True,
+    type=click.Choice(["amplitude", "phase", "real", "imag"]),
+    help="Quantity to threshold on.",
+)
+@click.option(
+    "--zarr-path", default=None, show_default=True, help="Path for Zarr store (default: tempdir)."
+)
+@click.option("--chunk-size", default=50_000, show_default=True, help="Rows per MS read chunk.")
+@click.option(
+    "--n-readers", default=4, show_default=True, help="Number of parallel reader processes."
+)
+@click.option(
+    "--min-neighbors",
+    default=3,
+    show_default=True,
+    help="Min occupied neighbors for local threshold.",
+)
+@click.option("--uvrange", default=None, help="UV range in lambda as UVMIN,UVMAX (e.g. 100,50000).")
+@click.option("--spw", "spw_ids", multiple=True, type=int, help="SPW IDs to process (repeatable).")
+@click.option(
+    "--field", "field_ids", multiple=True, type=int, help="Field IDs to process (repeatable)."
+)
+@click.option(
+    "--plot-dir",
+    default=None,
+    type=click.Path(),
+    help="Directory for before/after diagnostic plots.",
+)
+@click.option(
+    "--persist-cache",
+    is_flag=True,
+    default=False,
+    help="Keep the Zarr intermediate store after the run.",
+)
+@click.option(
+    "--log-level",
+    default="INFO",
+    show_default=True,
+    type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR"]),
+)
 def main(
     ms_path: str,
     cell_size: float,

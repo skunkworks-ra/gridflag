@@ -57,9 +57,7 @@ def neighbor_count(count_grid: NDArray, kernel_size: int) -> NDArray:
     kernel centred on each cell (excluding the cell itself).
     """
     mask = (count_grid > 0).astype(np.float64)
-    total = uniform_filter(mask, size=kernel_size, mode="constant") * (
-        kernel_size ** 2
-    )
+    total = uniform_filter(mask, size=kernel_size, mode="constant") * (kernel_size**2)
     # Subtract self.
     n_neighbors = np.rint(total).astype(np.int32) - (count_grid > 0).astype(np.int32)
     return n_neighbors

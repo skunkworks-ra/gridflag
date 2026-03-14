@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import numpy as np
 import pytest
 
@@ -22,8 +20,7 @@ def populated_store(tmp_path):
     N = 5
     gshape = (2 * N + 1, N + 1)
     store.set_grid_shape(gshape)
-    store.init_spw(0, n_chan=1, n_corr=1, ref_freq=1e9,
-                   chan_freqs=np.array([1e9]))
+    store.init_spw(0, n_chan=1, n_corr=1, ref_freq=1e9, chan_freqs=np.array([1e9]))
 
     rng = np.random.default_rng(42)
 
@@ -36,10 +33,13 @@ def populated_store(tmp_path):
     values[:10] = 50.0
 
     store.append(
-        0, 0,
+        0,
+        0,
         np.arange(n_vis, dtype=np.int64),
         np.zeros(n_vis, dtype=np.int32),
-        cell_u, cell_v, values,
+        cell_u,
+        cell_v,
+        values,
     )
 
     # Compute and store "before" grids.
@@ -104,17 +104,30 @@ class TestPlotGridsBeforeAfter:
         return {
             "median_before": median_before,
             "std_before": std_before,
-            "cu": cu, "cv": cv, "vals": vals, "flags": flags,
-            "gshape": gshape, "cell_size": 10.0, "N": N,
+            "cu": cu,
+            "cv": cv,
+            "vals": vals,
+            "flags": flags,
+            "gshape": gshape,
+            "cell_size": 10.0,
+            "N": N,
         }
 
     def test_creates_png_files(self, synthetic_data, tmp_path):
         d = synthetic_data
         paths = plot_grids_before_after(
-            d["median_before"], d["std_before"],
-            d["cu"], d["cv"], d["vals"], d["flags"],
-            d["gshape"], d["cell_size"], d["N"],
-            spw_id=0, corr_id=0, output_dir=tmp_path,
+            d["median_before"],
+            d["std_before"],
+            d["cu"],
+            d["cv"],
+            d["vals"],
+            d["flags"],
+            d["gshape"],
+            d["cell_size"],
+            d["N"],
+            spw_id=0,
+            corr_id=0,
+            output_dir=tmp_path,
         )
         assert len(paths) == 2
         for p in paths:
@@ -125,10 +138,18 @@ class TestPlotGridsBeforeAfter:
     def test_file_naming(self, synthetic_data, tmp_path):
         d = synthetic_data
         paths = plot_grids_before_after(
-            d["median_before"], d["std_before"],
-            d["cu"], d["cv"], d["vals"], d["flags"],
-            d["gshape"], d["cell_size"], d["N"],
-            spw_id=2, corr_id=1, output_dir=tmp_path,
+            d["median_before"],
+            d["std_before"],
+            d["cu"],
+            d["cv"],
+            d["vals"],
+            d["flags"],
+            d["gshape"],
+            d["cell_size"],
+            d["N"],
+            spw_id=2,
+            corr_id=1,
+            output_dir=tmp_path,
         )
         names = {p.name for p in paths}
         assert "spw2_corr1_median.png" in names
@@ -139,10 +160,18 @@ class TestPlotGridsBeforeAfter:
         d = synthetic_data
         all_flagged = np.ones(len(d["vals"]), dtype=bool)
         paths = plot_grids_before_after(
-            d["median_before"], d["std_before"],
-            d["cu"], d["cv"], d["vals"], all_flagged,
-            d["gshape"], d["cell_size"], d["N"],
-            spw_id=0, corr_id=0, output_dir=tmp_path,
+            d["median_before"],
+            d["std_before"],
+            d["cu"],
+            d["cv"],
+            d["vals"],
+            all_flagged,
+            d["gshape"],
+            d["cell_size"],
+            d["N"],
+            spw_id=0,
+            corr_id=0,
+            output_dir=tmp_path,
         )
         assert len(paths) == 2
         for p in paths:
@@ -152,10 +181,18 @@ class TestPlotGridsBeforeAfter:
         d = synthetic_data
         nested = tmp_path / "sub" / "dir"
         paths = plot_grids_before_after(
-            d["median_before"], d["std_before"],
-            d["cu"], d["cv"], d["vals"], d["flags"],
-            d["gshape"], d["cell_size"], d["N"],
-            spw_id=0, corr_id=0, output_dir=nested,
+            d["median_before"],
+            d["std_before"],
+            d["cu"],
+            d["cv"],
+            d["vals"],
+            d["flags"],
+            d["gshape"],
+            d["cell_size"],
+            d["N"],
+            spw_id=0,
+            corr_id=0,
+            output_dir=nested,
         )
         assert nested.is_dir()
         assert len(paths) == 2

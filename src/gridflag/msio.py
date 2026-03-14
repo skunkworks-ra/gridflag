@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterator
 from dataclasses import dataclass
-from typing import Iterator
 
 import numpy as np
 from numpy.typing import NDArray
@@ -17,9 +17,9 @@ class MSChunk:
     """A chunk of rows read from an MS."""
 
     data: NDArray[np.complexfloating]  # (n_row, n_chan, n_corr)
-    uvw: NDArray[np.float64]           # (n_row, 3)
-    flags: NDArray[np.bool_]           # (n_row, n_chan, n_corr)
-    row_indices: NDArray[np.int64]     # (n_row,) — absolute row indices in MS
+    uvw: NDArray[np.float64]  # (n_row, 3)
+    flags: NDArray[np.bool_]  # (n_row, n_chan, n_corr)
+    row_indices: NDArray[np.int64]  # (n_row,) — absolute row indices in MS
     spw_id: int
     field_id: int
 
@@ -27,6 +27,7 @@ class MSChunk:
 def _import_casatools():
     """Lazy import of casatools."""
     import casatools  # type: ignore[import-untyped]
+
     return casatools
 
 

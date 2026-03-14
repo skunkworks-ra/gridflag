@@ -15,9 +15,9 @@ class TestFlagVisibilities:
         values = np.array([5.0, 15.0, 8.0], dtype=np.float32)
 
         flags = flag_visibilities(cell_u, cell_v, values, threshold)
-        assert flags[0] == False
-        assert flags[1] == True
-        assert flags[2] == False
+        assert not flags[0]
+        assert flags[1]
+        assert not flags[2]
 
     def test_nan_threshold_flags(self):
         """NaN thresholds should flag everything in that cell."""
@@ -27,7 +27,7 @@ class TestFlagVisibilities:
         values = np.array([1.0], dtype=np.float32)
 
         flags = flag_visibilities(cell_u, cell_v, values, threshold)
-        assert flags[0] == True
+        assert flags[0]
 
     def test_equal_to_threshold(self):
         """Values equal to threshold should NOT be flagged."""
@@ -37,7 +37,7 @@ class TestFlagVisibilities:
         values = np.array([10.0], dtype=np.float32)
 
         flags = flag_visibilities(cell_u, cell_v, values, threshold)
-        assert flags[0] == False
+        assert not flags[0]
 
     def test_all_below(self):
         """All values below threshold → no flags."""
@@ -76,8 +76,8 @@ class TestFlagVisibilities:
         values = np.array([10.0, 10.0], dtype=np.float32)
 
         flags = flag_visibilities(cell_u, cell_v, values, threshold)
-        assert flags[0] == True   # 10 > 5
-        assert flags[1] == False  # 10 < 100
+        assert flags[0]  # 10 > 5
+        assert not flags[1]  # 10 < 100
 
     def test_negative_values(self):
         """Negative values (e.g. from real/imag) should compare correctly."""
@@ -87,8 +87,8 @@ class TestFlagVisibilities:
         values = np.array([-5.0, 5.0], dtype=np.float32)
 
         flags = flag_visibilities(cell_u, cell_v, values, threshold)
-        assert flags[0] == False  # -5 < 0
-        assert flags[1] == True   # 5 > 0
+        assert not flags[0]  # -5 < 0
+        assert flags[1]  # 5 > 0
 
     def test_output_dtype(self):
         threshold = np.array([[10.0]], dtype=np.float32)

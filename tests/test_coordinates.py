@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import numpy as np
-import pytest
 
 from gridflag.coordinates import (
     compute_N,
@@ -27,7 +26,6 @@ class TestScaleUV:
 
     def test_frequency_scaling(self):
         """Higher frequency → larger uv in wavelengths."""
-        c = 299_792_458.0
         uvw = np.array([[100.0, 0.0, 0.0]])
         freq = np.array([1.0e9, 2.0e9])
         ref_freq = 1.0e9

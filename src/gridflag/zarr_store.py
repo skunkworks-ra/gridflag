@@ -50,10 +50,16 @@ class AccumulatorGroup:
     def concatenate(self) -> dict[str, NDArray]:
         """Concatenate all chunks into single arrays."""
         if not self.values:
-            return {k: np.array([], dtype=d) for k, d in [
-                ("row_indices", "i8"), ("chan_indices", "i4"),
-                ("cell_u", "i4"), ("cell_v", "i4"), ("values", "f4"),
-            ]}
+            return {
+                k: np.array([], dtype=d)
+                for k, d in [
+                    ("row_indices", "i8"),
+                    ("chan_indices", "i4"),
+                    ("cell_u", "i4"),
+                    ("cell_v", "i4"),
+                    ("values", "f4"),
+                ]
+            }
         return {
             "row_indices": np.concatenate(self.row_indices),
             "chan_indices": np.concatenate(self.chan_indices),
@@ -118,7 +124,11 @@ class ZarrStore:
     ) -> None:
         """Append a batch of flat visibility records (in-memory accumulation)."""
         self._accumulators[(spw_id, corr_id)].append(
-            row_indices, chan_indices, cell_u, cell_v, values,
+            row_indices,
+            chan_indices,
+            cell_u,
+            cell_v,
+            values,
         )
 
     def flush(self, spw_id: int, corr_id: int) -> None:
@@ -131,16 +141,14 @@ class ZarrStore:
 
     def flush_all(self) -> None:
         """Flush all remaining accumulators to Zarr."""
-        for (spw_id, corr_id) in list(self._accumulators.keys()):
+        for spw_id, corr_id in list(self._accumulators.keys()):
             self.flush(spw_id, corr_id)
 
     # ------------------------------------------------------------------
     # Read flat arrays back (pass 1.5)
     # ------------------------------------------------------------------
 
-    def load_flat(
-        self, spw_id: int, corr_id: int
-    ) -> dict[str, NDArray]:
+    def load_flat(self, spw_id: int, corr_id: int) -> dict[str, NDArray]:
         """Load the flat arrays for one (spw, corr) pair."""
         # If not yet flushed, flush first.
         if (spw_id, corr_id) in self._accumulators:

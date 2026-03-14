@@ -135,7 +135,10 @@ def run(
         store.init_spw(spw_id, n_chan, n_corr, ref_freq, chan_freqs)
         log.info(
             "SPW %d: %d chan, %d corr, ref_freq=%.3f MHz",
-            spw_id, n_chan, n_corr, ref_freq / 1e6,
+            spw_id,
+            n_chan,
+            n_corr,
+            ref_freq / 1e6,
         )
 
         for chunk in read_chunks(ms_path, data_column, config.chunk_size, spw_id):
@@ -156,7 +159,7 @@ def run(
             # vis conjugation handled per-corr below.
 
             # Cell assignment with global N.
-            cell_u = (np.rint(u_ch / config.cell_size).astype(np.int32) + global_N)
+            cell_u = np.rint(u_ch / config.cell_size).astype(np.int32) + global_N
             cell_v = np.rint(v_ch / config.cell_size).astype(np.int32)
 
             # UV distance filter.
@@ -192,9 +195,12 @@ def run(
                     continue
 
                 store.append(
-                    spw_id, corr,
-                    row_idx[keep], chan_idx[keep],
-                    cell_u_flat[keep], cell_v_flat[keep],
+                    spw_id,
+                    corr,
+                    row_idx[keep],
+                    chan_idx[keep],
+                    cell_u_flat[keep],
+                    cell_v_flat[keep],
                     vals[keep],
                 )
 
@@ -231,26 +237,34 @@ def run(
             log.info("SPW %d corr %d: %d unflagged visibilities", spw_id, corr, n_total)
 
             # Per-cell statistics (numba JIT).
-            median_grid, std_grid, count_grid = compute_cell_stats(
-                cu, cv, vals, gshape
-            )
+            median_grid, std_grid, count_grid = compute_cell_stats(cu, cv, vals, gshape)
             store.store_grid(spw_id, corr, "median_grid", median_grid)
             store.store_grid(spw_id, corr, "std_grid", std_grid)
             store.store_grid(spw_id, corr, "count_grid", count_grid)
 
             # Thresholds.
             local_thr = local_neighborhood_threshold(
-                median_grid, std_grid, count_grid,
-                config.nsigma, config.smoothing_window,
+                median_grid,
+                std_grid,
+                count_grid,
+                config.nsigma,
+                config.smoothing_window,
             )
             annular_thr = annular_threshold(
-                median_grid, std_grid, count_grid,
-                config.cell_size, config.annulus_widths,
-                config.nsigma, global_N,
+                median_grid,
+                std_grid,
+                count_grid,
+                config.cell_size,
+                config.annulus_widths,
+                config.nsigma,
+                global_N,
             )
             threshold_grid = combine_thresholds(
-                local_thr, annular_thr, count_grid,
-                config.smoothing_window, config.min_neighbors,
+                local_thr,
+                annular_thr,
+                count_grid,
+                config.smoothing_window,
+                config.min_neighbors,
             )
             store.store_grid(spw_id, corr, "threshold_grid", threshold_grid)
 
@@ -259,7 +273,10 @@ def run(
             n_flagged = int(np.sum(flags))
             log.info(
                 "SPW %d corr %d: %d / %d flagged (%.2f%%)",
-                spw_id, corr, n_flagged, n_total,
+                spw_id,
+                corr,
+                n_flagged,
+                n_total,
                 100.0 * n_flagged / max(n_total, 1),
             )
 
@@ -270,8 +287,10 @@ def run(
                 grid_cache[(spw_id, corr)] = {
                     "median_before": median_grid,
                     "std_before": std_grid,
-                    "cu": cu, "cv": cv,
-                    "vals": vals, "flags": flags,
+                    "cu": cu,
+                    "cv": cv,
+                    "vals": vals,
+                    "flags": flags,
                 }
 
             if n_flagged > 0:
@@ -293,7 +312,10 @@ def run(
         all_corrs = np.concatenate(all_flag_corrs)
 
         total_newly_flagged = write_flags_batched(
-            ms_path, all_rows, all_chans, all_corrs,
+            ms_path,
+            all_rows,
+            all_chans,
+            all_corrs,
         )
 
     t_write = time.monotonic() - t_write_start
@@ -326,7 +348,9 @@ def run(
                 plot_paths.extend(str(p) for p in paths)
             except Exception:
                 log.warning(
-                    "Failed to plot SPW %d corr %d", spw_id, corr,
+                    "Failed to plot SPW %d corr %d",
+                    spw_id,
+                    corr,
                     exc_info=True,
                 )
 

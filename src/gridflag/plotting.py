@@ -42,10 +42,12 @@ def _plot_comparison(
     before_masked = np.where(before == 0, np.nan, before.astype(np.float64))
     after_masked = np.where(after == 0, np.nan, after.astype(np.float64))
 
-    all_finite = np.concatenate([
-        before_masked[np.isfinite(before_masked)],
-        after_masked[np.isfinite(after_masked)],
-    ])
+    all_finite = np.concatenate(
+        [
+            before_masked[np.isfinite(before_masked)],
+            after_masked[np.isfinite(after_masked)],
+        ]
+    )
     if len(all_finite) == 0:
         log.warning("No finite data for %s, skipping", output_path)
         return
@@ -70,20 +72,31 @@ def _plot_comparison(
     extent = [u_extent[0], u_extent[1], v_extent[0], v_extent[1]]
 
     fig, (ax1, ax2) = plt.subplots(
-        2, 1, figsize=(12, 8), constrained_layout=True,
+        2,
+        1,
+        figsize=(12, 8),
+        constrained_layout=True,
         sharex=True,
     )
 
-    im1 = ax1.imshow(
-        before_masked.T, origin="lower", aspect="auto",
-        extent=extent, norm=norm, cmap=cmap,
+    ax1.imshow(
+        before_masked.T,
+        origin="lower",
+        aspect="auto",
+        extent=extent,
+        norm=norm,
+        cmap=cmap,
     )
     ax1.set_title(title_before)
     ax1.set_ylabel("v (kλ)")
 
     im2 = ax2.imshow(
-        after_masked.T, origin="lower", aspect="auto",
-        extent=extent, norm=norm, cmap=cmap,
+        after_masked.T,
+        origin="lower",
+        aspect="auto",
+        extent=extent,
+        norm=norm,
+        cmap=cmap,
     )
     ax2.set_title(title_after)
     ax2.set_xlabel("u (kλ)")
@@ -137,19 +150,27 @@ def plot_before_after(
 
     median_path = output_dir / f"{prefix}_median.png"
     _plot_comparison(
-        median_before, median_after,
-        "Median (before)", "Median (after)",
+        median_before,
+        median_after,
+        "Median (before)",
+        "Median (after)",
         f"Median grid — SPW {spw_id}, Corr {corr_id}",
-        cell_size, N, median_path,
+        cell_size,
+        N,
+        median_path,
     )
     saved.append(median_path)
 
     std_path = output_dir / f"{prefix}_std.png"
     _plot_comparison(
-        std_before, std_after,
-        "Robust σ (before)", "Robust σ (after)",
+        std_before,
+        std_after,
+        "Robust σ (before)",
+        "Robust σ (after)",
         f"Robust σ grid — SPW {spw_id}, Corr {corr_id}",
-        cell_size, N, std_path,
+        cell_size,
+        N,
+        std_path,
     )
     saved.append(std_path)
 
@@ -177,7 +198,10 @@ def plot_grids_before_after(
     keep = ~flags
     if np.any(keep):
         median_after, std_after, _ = compute_cell_stats(
-            cu[keep], cv[keep], vals[keep], gshape,
+            cu[keep],
+            cv[keep],
+            vals[keep],
+            gshape,
         )
     else:
         median_after = np.full(gshape, np.nan, dtype=np.float32)
@@ -188,19 +212,27 @@ def plot_grids_before_after(
 
     median_path = output_dir / f"{prefix}_median.png"
     _plot_comparison(
-        median_before, median_after,
-        "Median (before)", "Median (after)",
+        median_before,
+        median_after,
+        "Median (before)",
+        "Median (after)",
         f"Median grid — SPW {spw_id}, Corr {corr_id}",
-        cell_size, N, median_path,
+        cell_size,
+        N,
+        median_path,
     )
     saved.append(median_path)
 
     std_path = output_dir / f"{prefix}_std.png"
     _plot_comparison(
-        std_before, std_after,
-        "Robust σ (before)", "Robust σ (after)",
+        std_before,
+        std_after,
+        "Robust σ (before)",
+        "Robust σ (after)",
         f"Robust σ grid — SPW {spw_id}, Corr {corr_id}",
-        cell_size, N, std_path,
+        cell_size,
+        N,
+        std_path,
     )
     saved.append(std_path)
 

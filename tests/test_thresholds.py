@@ -20,8 +20,9 @@ class TestLocalNeighborhoodThreshold:
         std_grid = np.full(shape, 1.0, dtype=np.float32)
         count_grid = np.full(shape, 100, dtype=np.int32)
 
-        thr = local_neighborhood_threshold(median_grid, std_grid, count_grid,
-                                           nsigma=3.0, kernel_size=3)
+        thr = local_neighborhood_threshold(
+            median_grid, std_grid, count_grid, nsigma=3.0, kernel_size=3
+        )
         # Interior cells should get threshold ≈ 5 + 3*1 = 8.
         np.testing.assert_allclose(thr[5, 3], 8.0, atol=0.01)
 
@@ -32,8 +33,9 @@ class TestLocalNeighborhoodThreshold:
         std_grid = np.zeros(shape, dtype=np.float32)
         count_grid = np.zeros(shape, dtype=np.int32)
 
-        thr = local_neighborhood_threshold(median_grid, std_grid, count_grid,
-                                           nsigma=3.0, kernel_size=3)
+        thr = local_neighborhood_threshold(
+            median_grid, std_grid, count_grid, nsigma=3.0, kernel_size=3
+        )
         assert np.all(np.isnan(thr))
 
     def test_nsigma_zero(self):
@@ -43,21 +45,22 @@ class TestLocalNeighborhoodThreshold:
         std_grid = np.full(shape, 5.0, dtype=np.float32)
         count_grid = np.ones(shape, dtype=np.int32)
 
-        thr = local_neighborhood_threshold(median_grid, std_grid, count_grid,
-                                           nsigma=0.0, kernel_size=3)
+        thr = local_neighborhood_threshold(
+            median_grid, std_grid, count_grid, nsigma=0.0, kernel_size=3
+        )
         # Interior should be ~10.0 (median, no sigma contribution).
         np.testing.assert_allclose(thr[3, 2], 10.0, atol=0.5)
 
     def test_kernel_size_1(self):
         """K=1 → no smoothing, per-cell threshold."""
         shape = (3, 3)
-        median_grid = np.array([[1, 2, 3], [4, 5, 6], [7, 8, 9]],
-                               dtype=np.float32)
+        median_grid = np.array([[1, 2, 3], [4, 5, 6], [7, 8, 9]], dtype=np.float32)
         std_grid = np.ones(shape, dtype=np.float32)
         count_grid = np.ones(shape, dtype=np.int32)
 
-        thr = local_neighborhood_threshold(median_grid, std_grid, count_grid,
-                                           nsigma=1.0, kernel_size=1)
+        thr = local_neighborhood_threshold(
+            median_grid, std_grid, count_grid, nsigma=1.0, kernel_size=1
+        )
         # Each cell: median + 1*std = median + 1.
         expected = median_grid + 1.0
         np.testing.assert_allclose(thr, expected, atol=1e-5)
@@ -73,8 +76,9 @@ class TestLocalNeighborhoodThreshold:
         std_grid[2, 1] = 2.0
         count_grid[2, 1] = 50
 
-        thr = local_neighborhood_threshold(median_grid, std_grid, count_grid,
-                                           nsigma=3.0, kernel_size=3)
+        thr = local_neighborhood_threshold(
+            median_grid, std_grid, count_grid, nsigma=3.0, kernel_size=3
+        )
         assert not np.isnan(thr[2, 1])  # occupied cell has a threshold
         assert np.isnan(thr[0, 0])  # far empty cell
 
@@ -122,8 +126,13 @@ class TestAnnularThreshold:
         count_grid = np.ones(shape, dtype=np.int32)
 
         thr = annular_threshold(
-            median_grid, std_grid, count_grid,
-            cell_size=1.0, annulus_widths=(1000.0,), nsigma=3.0, N=N,
+            median_grid,
+            std_grid,
+            count_grid,
+            cell_size=1.0,
+            annulus_widths=(1000.0,),
+            nsigma=3.0,
+            N=N,
         )
         occupied = count_grid > 0
         np.testing.assert_allclose(thr[occupied], 16.0, atol=0.01)
@@ -146,8 +155,13 @@ class TestAnnularThreshold:
         count_grid[N, N] = 1
 
         thr = annular_threshold(
-            median_grid, std_grid, count_grid,
-            cell_size=1.0, annulus_widths=(5.0, 100.0), nsigma=3.0, N=N,
+            median_grid,
+            std_grid,
+            count_grid,
+            cell_size=1.0,
+            annulus_widths=(5.0, 100.0),
+            nsigma=3.0,
+            N=N,
         )
         # The two cells are in different annuli → different thresholds.
         assert thr[N, 0] != thr[N, N]
@@ -160,7 +174,10 @@ class TestAnnularThreshold:
             np.zeros(shape, dtype=np.float32),
             np.zeros(shape, dtype=np.float32),
             np.zeros(shape, dtype=np.int32),
-            cell_size=1.0, annulus_widths=(10.0,), nsigma=3.0, N=N,
+            cell_size=1.0,
+            annulus_widths=(10.0,),
+            nsigma=3.0,
+            N=N,
         )
         assert np.all(np.isnan(thr))
 
@@ -173,8 +190,7 @@ class TestCombineThresholds:
         annular = np.full(shape, 8.0, dtype=np.float32)
         count_grid = np.ones(shape, dtype=np.int32) * 10
 
-        combined = combine_thresholds(local, annular, count_grid,
-                                      kernel_size=3, min_neighbors=1)
+        combined = combine_thresholds(local, annular, count_grid, kernel_size=3, min_neighbors=1)
         np.testing.assert_allclose(combined, 8.0)
 
     def test_sparse_uses_annular(self):
@@ -185,8 +201,7 @@ class TestCombineThresholds:
         count_grid = np.zeros(shape, dtype=np.int32)
         count_grid[2, 1] = 1  # single occupied cell
 
-        combined = combine_thresholds(local, annular, count_grid,
-                                      kernel_size=3, min_neighbors=1)
+        combined = combine_thresholds(local, annular, count_grid, kernel_size=3, min_neighbors=1)
         np.testing.assert_allclose(combined[2, 1], 12.0)
 
     def test_min_neighbors_zero(self):
@@ -197,8 +212,7 @@ class TestCombineThresholds:
         count_grid = np.zeros(shape, dtype=np.int32)
         count_grid[2, 1] = 1
 
-        combined = combine_thresholds(local, annular, count_grid,
-                                      kernel_size=3, min_neighbors=0)
+        combined = combine_thresholds(local, annular, count_grid, kernel_size=3, min_neighbors=0)
         # 0 neighbors >= min_neighbors=0, so use min(5, 8) = 5.
         np.testing.assert_allclose(combined[2, 1], 5.0)
 
@@ -209,8 +223,7 @@ class TestCombineThresholds:
         annular = np.full(shape, 8.0, dtype=np.float32)
         count_grid = np.zeros(shape, dtype=np.int32)
 
-        combined = combine_thresholds(local, annular, count_grid,
-                                      kernel_size=3, min_neighbors=1)
+        combined = combine_thresholds(local, annular, count_grid, kernel_size=3, min_neighbors=1)
         assert np.all(np.isnan(combined))
 
     def test_nan_local_uses_annular(self):
@@ -220,7 +233,6 @@ class TestCombineThresholds:
         annular = np.full(shape, 7.0, dtype=np.float32)
         count_grid = np.ones(shape, dtype=np.int32) * 10
 
-        combined = combine_thresholds(local, annular, count_grid,
-                                      kernel_size=3, min_neighbors=1)
+        combined = combine_thresholds(local, annular, count_grid, kernel_size=3, min_neighbors=1)
         # Interior cells should use annular (fmin ignores NaN).
         np.testing.assert_allclose(combined[2, 1], 7.0)
