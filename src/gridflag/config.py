@@ -22,6 +22,7 @@ class GridFlagConfig:
     spw_ids: tuple[int, ...] | None = None
     field_ids: tuple[int, ...] | None = None
     uvrange: tuple[float, float] | None = None  # (uv_min, uv_max) in lambda
+    n_bins: int = 256  # histogram bins for streaming statistics
 
     def to_json(self) -> str:
         return json.dumps(dataclasses.asdict(self))

@@ -7,6 +7,7 @@ import multiprocessing
 import shutil
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import numpy as np
@@ -18,7 +19,7 @@ from gridflag.coordinates import (
     grid_shape,
 )
 from gridflag.flagger import flag_visibilities
-from gridflag.gridder import compute_cell_stats
+from gridflag.histogram import compute_cell_stats_streaming
 from gridflag.msio import (
     available_cpus,
     available_memory_gb,
@@ -220,6 +221,128 @@ def _process_chunk_worker(args: tuple) -> str:
     return shard_path
 
 
+# ── Shard indexing and streaming flag pass ──────────────────────
+
+
+def _index_shards(shard_paths: list[str]) -> dict[tuple[int, int], list[str]]:
+    """Pre-scan shard zarr stores, return {(spw_id, corr_id): [shard_path, ...]}."""
+    index: dict[tuple[int, int], list[str]] = {}
+    for sp in shard_paths:
+        root = zarr.open(sp, mode="r")
+        for spw_key in root:
+            spw_id = int(spw_key.split("_")[1])
+            spw_grp = root[spw_key]
+            for corr_key in spw_grp:
+                corr_id = int(corr_key.split("_")[1])
+                index.setdefault((spw_id, corr_id), []).append(sp)
+    return index
+
+
+def _flag_one_shard(
+    shard_path: str,
+    spw_key: str,
+    corr_key: str,
+    threshold_grid: np.ndarray,
+    collect_plot_data: bool,
+) -> dict:
+    """Read one shard, flag visibilities, return flag indices and optional plot data."""
+    root = zarr.open(shard_path, mode="r")
+    try:
+        grp = root[spw_key][corr_key]
+    except KeyError:
+        return {"n_flagged": 0, "flag_rows": None, "flag_chans": None, "plot_data": None}
+
+    cu = grp["cell_u"][:].astype(np.intp)
+    cv = grp["cell_v"][:].astype(np.intp)
+    vals = grp["values"][:]
+    row_indices = grp["row_indices"][:]
+    chan_indices = grp["chan_indices"][:]
+
+    if len(vals) == 0:
+        return {"n_flagged": 0, "flag_rows": None, "flag_chans": None, "plot_data": None}
+
+    flags = flag_visibilities(cu, cv, vals, threshold_grid)
+    n_flagged = int(np.sum(flags))
+
+    flag_rows = None
+    flag_chans = None
+    if n_flagged > 0:
+        idx = np.where(flags)[0]
+        flag_rows = row_indices[idx]
+        flag_chans = chan_indices[idx]
+
+    plot_data = None
+    if collect_plot_data:
+        plot_data = {"cu": cu, "cv": cv, "vals": vals, "flags": flags}
+
+    return {
+        "n_flagged": n_flagged,
+        "flag_rows": flag_rows,
+        "flag_chans": flag_chans,
+        "plot_data": plot_data,
+    }
+
+
+def _flag_shards(
+    shard_paths: list[str],
+    spw_key: str,
+    corr_key: str,
+    threshold_grid: np.ndarray,
+    n_threads: int,
+    collect_plot_data: bool = False,
+) -> dict:
+    """Flag visibilities across all shards for one (spw, corr).
+
+    Returns dict with keys: n_flagged, flag_rows, flag_chans, plot_data.
+    """
+    all_flag_rows: list[np.ndarray] = []
+    all_flag_chans: list[np.ndarray] = []
+    total_flagged = 0
+
+    # Plot data: concatenated across shards (only when requested).
+    plot_cu: list[np.ndarray] = []
+    plot_cv: list[np.ndarray] = []
+    plot_vals: list[np.ndarray] = []
+    plot_flags: list[np.ndarray] = []
+
+    with ThreadPoolExecutor(max_workers=n_threads) as pool:
+        futures = {
+            pool.submit(
+                _flag_one_shard, sp, spw_key, corr_key,
+                threshold_grid, collect_plot_data,
+            ): sp
+            for sp in shard_paths
+        }
+        for fut in as_completed(futures):
+            result = fut.result()
+            total_flagged += result["n_flagged"]
+            if result["flag_rows"] is not None:
+                all_flag_rows.append(result["flag_rows"])
+                all_flag_chans.append(result["flag_chans"])
+            if result["plot_data"] is not None:
+                pd = result["plot_data"]
+                plot_cu.append(pd["cu"])
+                plot_cv.append(pd["cv"])
+                plot_vals.append(pd["vals"])
+                plot_flags.append(pd["flags"])
+
+    merged_plot = None
+    if collect_plot_data and plot_cu:
+        merged_plot = {
+            "cu": np.concatenate(plot_cu),
+            "cv": np.concatenate(plot_cv),
+            "vals": np.concatenate(plot_vals),
+            "flags": np.concatenate(plot_flags),
+        }
+
+    return {
+        "n_flagged": total_flagged,
+        "flag_rows": np.concatenate(all_flag_rows) if all_flag_rows else None,
+        "flag_chans": np.concatenate(all_flag_chans) if all_flag_chans else None,
+        "plot_data": merged_plot,
+    }
+
+
 # ── Main pipeline ───────────────────────────────────────────────
 
 
@@ -242,9 +365,9 @@ def run(
     Data flow:
       1. Parallel read MS → compute UV coords, cell indices → each worker
          writes its own zarr shard
-      2. Collect shards into main ZarrStore
-      3. Per (SPW, corr): load from Zarr → cell stats → thresholds → flags
-      4. Batch-write flags back to MS
+      2. Per (SPW, corr): streaming histogram stats over shards →
+         thresholds → streaming flag pass over shards
+      3. Batch-write flags back to MS
     """
     if config is None:
         config = GridFlagConfig()
@@ -377,38 +500,15 @@ def run(
     t_read = time.monotonic() - t_read_start
     log.info("Parallel read + compute: %.1fs (%d workers)", t_read, n_workers)
 
-    # ── Collect shards into main ZarrStore ──────────────────────────
-    t_collect_start = time.monotonic()
+    # ── Index shards by (spw, corr) ─────────────────────────────────
+    shard_index = _index_shards(shard_paths)
+    log.info("Shard index: %d (spw, corr) groups across %d shards", len(shard_index), len(shard_paths))
 
-    for shard_path in shard_paths:
-        shard_root = zarr.open(shard_path, mode="r")
-        for spw_key in shard_root:
-            spw_id = int(spw_key.split("_")[1])
-            spw_grp = shard_root[spw_key]
-            for corr_key in spw_grp:
-                corr_id = int(corr_key.split("_")[1])
-                cgrp = spw_grp[corr_key]
-                store.append(
-                    spw_id,
-                    corr_id,
-                    cgrp["row_indices"][:],
-                    cgrp["chan_indices"][:],
-                    cgrp["cell_u"][:],
-                    cgrp["cell_v"][:],
-                    cgrp["values"][:],
-                )
-
-    # Flush all accumulated data to main Zarr.
-    store.flush_all()
-
-    # Clean up shards.
-    shutil.rmtree(shard_dir, ignore_errors=True)
-
-    t_collect = time.monotonic() - t_collect_start
-    log.info("Shard collection: %.1fs", t_collect)
-
-    # ── Pass 1.5: Compute statistics, thresholds, flags ─────────────
+    # ── Streaming statistics, thresholds, flags ──────────────────────
     t_compute_start = time.monotonic()
+
+    # Thread count for streaming passes (zarr reads + numpy release GIL).
+    n_stat_threads = min(n_workers, 8)
 
     all_flag_rows: list[np.ndarray] = []
     all_flag_chans: list[np.ndarray] = []
@@ -420,21 +520,24 @@ def run(
     for spw_info in all_spws:
         spw_id = spw_info["spw_id"]
         n_corr = spw_info["n_corr"]
+        spw_key = f"spw_{spw_id}"
 
         for corr in range(n_corr):
-            flat = store.load_flat(spw_id, corr)
-            vals = flat["values"]
-            if len(vals) == 0:
+            corr_key = f"corr_{corr}"
+            group_shards = shard_index.get((spw_id, corr), [])
+            if not group_shards:
                 log.info("SPW %d corr %d: no data, skipping", spw_id, corr)
                 continue
 
-            cu = flat["cell_u"].astype(np.intp)
-            cv = flat["cell_v"].astype(np.intp)
-            n_total = len(vals)
+            # Two-pass streaming statistics over shards.
+            median_grid, std_grid, count_grid = compute_cell_stats_streaming(
+                group_shards, spw_key, corr_key, gshape,
+                n_bins=config.n_bins, n_threads=n_stat_threads,
+            )
+
+            n_total = int(count_grid.sum())
             log.info("SPW %d corr %d: %d unflagged visibilities", spw_id, corr, n_total)
 
-            # Per-cell statistics (numba JIT).
-            median_grid, std_grid, count_grid = compute_cell_stats(cu, cv, vals, gshape)
             store.store_grid(spw_id, corr, "median_grid", median_grid)
             store.store_grid(spw_id, corr, "std_grid", std_grid)
             store.store_grid(spw_id, corr, "count_grid", count_grid)
@@ -465,9 +568,13 @@ def run(
             )
             store.store_grid(spw_id, corr, "threshold_grid", threshold_grid)
 
-            # Flag.
-            flags = flag_visibilities(cu, cv, vals, threshold_grid)
-            n_flagged = int(np.sum(flags))
+            # Streaming flag pass: read each shard, flag, collect results.
+            flag_results = _flag_shards(
+                group_shards, spw_key, corr_key, threshold_grid,
+                n_stat_threads, collect_plot_data=(plot_dir is not None),
+            )
+
+            n_flagged = flag_results["n_flagged"]
             log.info(
                 "SPW %d corr %d: %d / %d flagged (%.2f%%)",
                 spw_id,
@@ -477,27 +584,32 @@ def run(
                 100.0 * n_flagged / max(n_total, 1),
             )
 
-            # Store flag mask for plotting.
-            store.store_grid(spw_id, corr, "flag_mask", flags.astype(np.uint8))
+            store.store_grid(spw_id, corr, "flag_mask",
+                             np.zeros(gshape, dtype=np.uint8))
 
-            if plot_dir is not None:
+            if plot_dir is not None and flag_results["plot_data"]:
+                pd = flag_results["plot_data"]
                 grid_cache[(spw_id, corr)] = {
                     "median_before": median_grid,
                     "std_before": std_grid,
-                    "cu": cu,
-                    "cv": cv,
-                    "vals": vals,
-                    "flags": flags,
+                    "cu": pd["cu"],
+                    "cv": pd["cv"],
+                    "vals": pd["vals"],
+                    "flags": pd["flags"],
                 }
 
-            if n_flagged > 0:
-                idx = np.where(flags)[0]
-                all_flag_rows.append(flat["row_indices"][idx])
-                all_flag_chans.append(flat["chan_indices"][idx])
-                all_flag_corrs.append(np.full(n_flagged, corr, dtype=np.int32))
+            if flag_results["flag_rows"] is not None:
+                all_flag_rows.append(flag_results["flag_rows"])
+                all_flag_chans.append(flag_results["flag_chans"])
+                all_flag_corrs.append(
+                    np.full(n_flagged, corr, dtype=np.int32)
+                )
 
     t_compute = time.monotonic() - t_compute_start
-    log.info("Compute: %.1fs", t_compute)
+    log.info("Streaming compute + flag: %.1fs", t_compute)
+
+    # Clean up shards.
+    shutil.rmtree(shard_dir, ignore_errors=True)
 
     # ── Pass 2: Batch-write flags back to MS ────────────────────────
     t_write_start = time.monotonic()
