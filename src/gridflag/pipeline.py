@@ -620,31 +620,24 @@ def run(
             else:
                 all_pairs.append((group_shards, spw_id_v, corr))
 
-    # Process pairs serially; Numba prange handles parallelism within each pair.
-    n_parallel = 1
-    if n_parallel > 0:
-        per_pair_threads = max(1, n_stat_threads // n_parallel)
-        with ThreadPoolExecutor(max_workers=n_parallel) as pair_pool:
-            pair_futures = [
-                pair_pool.submit(
-                    _process_spw_corr,
-                    group_shards, spw_id_v, corr, gshape, config,
-                    per_pair_threads, global_N, plot_dir, persist_cache, store,
-                )
-                for group_shards, spw_id_v, corr in all_pairs
-            ]
-            for fut in as_completed(pair_futures):
-                result = fut.result()
-                corr = result["corr"]
-                n_flagged = result["n_flagged"]
-                if result["flag_rows"] is not None:
-                    all_flag_rows.append(result["flag_rows"])
-                    all_flag_chans.append(result["flag_chans"])
-                    all_flag_corrs.append(
-                        np.full(n_flagged, corr, dtype=np.int32)
-                    )
-                if result["grid_cache_entry"] is not None:
-                    grid_cache[(result["spw_id"], corr)] = result["grid_cache_entry"]
+    # Process pairs serially on the main thread so Numba prange has uncontested
+    # access to the full thread pool.  A ThreadPoolExecutor wrapper (even with
+    # max_workers=1) causes Numba to suppress parallelism in worker threads.
+    for group_shards, spw_id_v, corr in all_pairs:
+        result = _process_spw_corr(
+            group_shards, spw_id_v, corr, gshape, config,
+            n_stat_threads, global_N, plot_dir, persist_cache, store,
+        )
+        corr = result["corr"]
+        n_flagged = result["n_flagged"]
+        if result["flag_rows"] is not None:
+            all_flag_rows.append(result["flag_rows"])
+            all_flag_chans.append(result["flag_chans"])
+            all_flag_corrs.append(
+                np.full(n_flagged, corr, dtype=np.int32)
+            )
+        if result["grid_cache_entry"] is not None:
+            grid_cache[(result["spw_id"], corr)] = result["grid_cache_entry"]
 
     t_compute = time.monotonic() - t_compute_start
     log.info("Streaming compute + flag: %.1fs", t_compute)
