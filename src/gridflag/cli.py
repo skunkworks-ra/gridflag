@@ -39,6 +39,8 @@ CONTEXT_SETTINGS = dict(help_option_names=["-h", "--help"])
               help="Field IDs to process (repeatable).")
 @click.option("--plot-dir", default=None, type=click.Path(),
               help="Directory for before/after diagnostic plots.")
+@click.option("--persist-cache", is_flag=True, default=False,
+              help="Keep the Zarr intermediate store after the run.")
 @click.option("--log-level", default="INFO", show_default=True,
               type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR"]))
 def main(
@@ -56,6 +58,7 @@ def main(
     spw_ids: tuple[int, ...],
     field_ids: tuple[int, ...],
     plot_dir: str | None,
+    persist_cache: bool,
     log_level: str,
 ) -> None:
     """Run GRIDflag UV-plane RFI flagging on a CASA Measurement Set."""
@@ -88,8 +91,9 @@ def main(
 
     from gridflag.pipeline import run
 
-    result = run(ms_path, config, plot_dir=plot_dir)
+    result = run(ms_path, config, plot_dir=plot_dir, persist_cache=persist_cache)
     click.echo(f"Flagged {result['total_newly_flagged']} visibilities.")
-    click.echo(f"Zarr store: {result['zarr_path']}")
+    if result.get("zarr_path"):
+        click.echo(f"Zarr store: {result['zarr_path']}")
     if result.get("plots"):
         click.echo(f"Plots: {', '.join(result['plots'])}")

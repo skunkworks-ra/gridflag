@@ -33,6 +33,7 @@ def gridflag(
     field_ids: tuple[int, ...] | None = None,
     uvrange: tuple[float, float] | None = None,
     plot_dir: str | None = None,
+    persist_cache: bool = False,
     log_level: str = "INFO",
 ) -> dict:
     """Run GRIDflag on a CASA Measurement Set.
@@ -74,6 +75,8 @@ def gridflag(
         UV distance range in lambda as (uv_min, uv_max).
     plot_dir : str or None
         If set, write before/after diagnostic PNGs to this directory.
+    persist_cache : bool
+        If True, keep the Zarr intermediate store after the run.
     log_level : str
         Logging level (DEBUG, INFO, WARNING, ERROR).
 
@@ -103,4 +106,4 @@ def gridflag(
         uvrange=uvrange,
     )
 
-    return run(ms_path, config, plot_dir=plot_dir)
+    return run(ms_path, config, plot_dir=plot_dir, persist_cache=persist_cache)

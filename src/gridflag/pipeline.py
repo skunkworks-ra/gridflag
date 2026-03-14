@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import shutil
 import time
 import uuid
 from pathlib import Path
@@ -63,8 +64,17 @@ def run(
     ms_path: str,
     config: GridFlagConfig | None = None,
     plot_dir: str | Path | None = None,
+    persist_cache: bool = False,
 ) -> dict:
     """Run the full GRIDflag pipeline on a measurement set.
+
+    Parameters
+    ----------
+    ms_path : path to CASA Measurement Set.
+    config : algorithm configuration (defaults applied if None).
+    plot_dir : if set, write before/after diagnostic PNGs here.
+    persist_cache : if True, keep the Zarr store after the run.
+        Default is False (clean up).
 
     Data flow:
       1. Read MS in chunks → compute UV coords, cell indices → accumulate
@@ -100,9 +110,10 @@ def run(
     gshape = grid_shape(global_N)
     log.info("Grid shape: %s  (N=%d)", gshape, global_N)
 
-    # Set up Zarr store.
+    # Set up Zarr store.  Explicit zarr_path implies persistence.
     if config.zarr_path is not None:
         zarr_path = Path(config.zarr_path)
+        persist_cache = True
     else:
         uid = uuid.uuid4().hex[:8]
         zarr_path = Path.cwd() / f"tmp_gridflag_uv_{uid}.zarr"
@@ -319,9 +330,14 @@ def run(
                     exc_info=True,
                 )
 
+    # ── Clean up Zarr store unless persisting ──────────────────────
+    if not persist_cache and zarr_path.exists():
+        shutil.rmtree(zarr_path)
+        log.debug("Removed Zarr cache: %s", zarr_path)
+
     return {
         "ms_path": ms_path,
-        "zarr_path": str(zarr_path),
+        "zarr_path": str(zarr_path) if persist_cache else None,
         "grid_shape": gshape,
         "total_newly_flagged": total_newly_flagged,
         "elapsed_s": t_total,

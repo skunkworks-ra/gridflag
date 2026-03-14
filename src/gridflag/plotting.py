@@ -34,15 +34,34 @@ def _plot_comparison(
     output_path: Path,
     cmap: str = "viridis",
 ) -> None:
-    """Plot two grids side-by-side on the same colour scale with a shared colorbar."""
+    """Plot two grids stacked vertically with shared log/symlog colour scale."""
     plt = _import_matplotlib()
+    from matplotlib.colors import LogNorm, SymLogNorm
 
     # Mask zeros/NaN for display.
     before_masked = np.where(before == 0, np.nan, before.astype(np.float64))
     after_masked = np.where(after == 0, np.nan, after.astype(np.float64))
 
-    vmin = np.nanmin([np.nanmin(before_masked), np.nanmin(after_masked)])
-    vmax = np.nanmax([np.nanmax(before_masked), np.nanmax(after_masked)])
+    all_finite = np.concatenate([
+        before_masked[np.isfinite(before_masked)],
+        after_masked[np.isfinite(after_masked)],
+    ])
+    if len(all_finite) == 0:
+        log.warning("No finite data for %s, skipping", output_path)
+        return
+
+    data_min = float(np.min(all_finite))
+    data_max = float(np.max(all_finite))
+
+    # Choose norm: LogNorm if all positive, SymLogNorm if negatives present.
+    if data_min > 0:
+        norm = LogNorm(vmin=data_min, vmax=data_max)
+    else:
+        # linthresh: linear region around zero; use a small fraction of the range.
+        linthresh = max(abs(data_min), abs(data_max)) * 1e-3
+        if linthresh == 0:
+            linthresh = 1.0
+        norm = SymLogNorm(linthresh=linthresh, vmin=data_min, vmax=data_max)
 
     # Axis extents in kλ.
     N_u, N_v = before.shape
@@ -50,25 +69,27 @@ def _plot_comparison(
     v_extent = [0, (N_v - 1) * cell_size / 1e3]
     extent = [u_extent[0], u_extent[1], v_extent[0], v_extent[1]]
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5), constrained_layout=True)
+    fig, (ax1, ax2) = plt.subplots(
+        2, 1, figsize=(12, 8), constrained_layout=True,
+        sharex=True,
+    )
 
     im1 = ax1.imshow(
         before_masked.T, origin="lower", aspect="auto",
-        extent=extent, vmin=vmin, vmax=vmax, cmap=cmap,
+        extent=extent, norm=norm, cmap=cmap,
     )
     ax1.set_title(title_before)
-    ax1.set_xlabel("u (kλ)")
     ax1.set_ylabel("v (kλ)")
 
     im2 = ax2.imshow(
         after_masked.T, origin="lower", aspect="auto",
-        extent=extent, vmin=vmin, vmax=vmax, cmap=cmap,
+        extent=extent, norm=norm, cmap=cmap,
     )
     ax2.set_title(title_after)
     ax2.set_xlabel("u (kλ)")
     ax2.set_ylabel("v (kλ)")
 
-    fig.colorbar(im2, ax=[ax1, ax2], shrink=0.8, label=suptitle)
+    fig.colorbar(im2, ax=[ax1, ax2], shrink=0.9)
     fig.suptitle(suptitle, fontsize=14)
     fig.savefig(output_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
