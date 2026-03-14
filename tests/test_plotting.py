@@ -9,7 +9,7 @@ import pytest
 
 from gridflag.config import GridFlagConfig
 from gridflag.gridder import compute_cell_stats
-from gridflag.plotting import plot_before_after
+from gridflag.plotting import plot_before_after, plot_grids_before_after
 from gridflag.zarr_store import ZarrStore
 
 
@@ -79,3 +79,83 @@ class TestPlotBeforeAfter:
         names = {p.name for p in paths}
         assert "spw0_corr0_median.png" in names
         assert "spw0_corr0_std.png" in names
+
+
+# ── plot_grids_before_after (array-based, no ZarrStore) ───────────
+
+
+class TestPlotGridsBeforeAfter:
+    @pytest.fixture
+    def synthetic_data(self):
+        rng = np.random.default_rng(99)
+        N = 5
+        gshape = (2 * N + 1, N + 1)
+
+        cu = rng.integers(0, gshape[0], size=200).astype(np.intp)
+        cv = rng.integers(0, gshape[1], size=200).astype(np.intp)
+        vals = rng.uniform(1.0, 10.0, size=200).astype(np.float32)
+        vals[:10] = 1000.0
+
+        flags = np.zeros(200, dtype=bool)
+        flags[:10] = True
+
+        median_before, std_before, _ = compute_cell_stats(cu, cv, vals, gshape)
+
+        return {
+            "median_before": median_before,
+            "std_before": std_before,
+            "cu": cu, "cv": cv, "vals": vals, "flags": flags,
+            "gshape": gshape, "cell_size": 10.0, "N": N,
+        }
+
+    def test_creates_png_files(self, synthetic_data, tmp_path):
+        d = synthetic_data
+        paths = plot_grids_before_after(
+            d["median_before"], d["std_before"],
+            d["cu"], d["cv"], d["vals"], d["flags"],
+            d["gshape"], d["cell_size"], d["N"],
+            spw_id=0, corr_id=0, output_dir=tmp_path,
+        )
+        assert len(paths) == 2
+        for p in paths:
+            assert p.exists()
+            assert p.suffix == ".png"
+            assert p.stat().st_size > 0
+
+    def test_file_naming(self, synthetic_data, tmp_path):
+        d = synthetic_data
+        paths = plot_grids_before_after(
+            d["median_before"], d["std_before"],
+            d["cu"], d["cv"], d["vals"], d["flags"],
+            d["gshape"], d["cell_size"], d["N"],
+            spw_id=2, corr_id=1, output_dir=tmp_path,
+        )
+        names = {p.name for p in paths}
+        assert "spw2_corr1_median.png" in names
+        assert "spw2_corr1_std.png" in names
+
+    def test_all_flagged(self, synthetic_data, tmp_path):
+        """All-flagged data should still produce plots (before has data)."""
+        d = synthetic_data
+        all_flagged = np.ones(len(d["vals"]), dtype=bool)
+        paths = plot_grids_before_after(
+            d["median_before"], d["std_before"],
+            d["cu"], d["cv"], d["vals"], all_flagged,
+            d["gshape"], d["cell_size"], d["N"],
+            spw_id=0, corr_id=0, output_dir=tmp_path,
+        )
+        assert len(paths) == 2
+        for p in paths:
+            assert p.exists()
+
+    def test_creates_output_dir(self, synthetic_data, tmp_path):
+        d = synthetic_data
+        nested = tmp_path / "sub" / "dir"
+        paths = plot_grids_before_after(
+            d["median_before"], d["std_before"],
+            d["cu"], d["cv"], d["vals"], d["flags"],
+            d["gshape"], d["cell_size"], d["N"],
+            spw_id=0, corr_id=0, output_dir=nested,
+        )
+        assert nested.is_dir()
+        assert len(paths) == 2
