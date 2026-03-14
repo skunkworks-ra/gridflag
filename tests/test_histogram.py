@@ -54,7 +54,7 @@ class TestPass1Ranges:
 
             grid_shape = (2, 2)
             cmin, cmax, ccount = pass1_ranges(
-                [sp], "spw_0", "corr_0", grid_shape,
+                [sp], "spw_0", "corr_0", grid_shape, n_threads=1
             )
             assert ccount[0 * 2 + 0] == 2  # cell (0,0)
             assert ccount[1 * 2 + 1] == 1  # cell (1,1)
@@ -78,7 +78,7 @@ class TestPass1Ranges:
             )
 
             cmin, cmax, ccount = pass1_ranges(
-                [sp1, sp2], "spw_0", "corr_0", (1, 1),
+                [sp1, sp2], "spw_0", "corr_0", (1, 1), n_threads=2
             )
             assert ccount[0] == 2
             assert cmin[0] == 2.0
@@ -95,7 +95,7 @@ class TestPass1Ranges:
             )
             # Ask for a different (spw, corr) → should return zeros.
             _, _, ccount = pass1_ranges(
-                [sp], "spw_1", "corr_0", (1, 1),
+                [sp], "spw_1", "corr_0", (1, 1), n_threads=1
             )
             assert ccount[0] == 0
 

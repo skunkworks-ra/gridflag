@@ -8,12 +8,17 @@ Pass 1 — Range discovery: track per-cell min, max, count (sparse per shard).
 Pass 2 — Histogram fill: bin values into per-cell histograms, chunked by
          occupied cells to bound memory.
 Extraction: median and IQR-based robust std from cumulative histograms.
+
+Threading model: shard reads + numpy compute release the GIL and run in
+parallel via ThreadPoolExecutor.  Accumulation into shared arrays
+(np.add.at) is done on the main thread only.
 """
 
 from __future__ import annotations
 
 import logging
 import math
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import zarr
@@ -42,6 +47,7 @@ def _pass1_one_shard(
     """Read one shard, return sparse (unique_cells, min, max, count).
 
     Returns None if the shard has no data for this (spw, corr).
+    All numpy ops release the GIL.
     """
     root = zarr.open(shard_path, mode="r")
     try:
@@ -77,12 +83,13 @@ def pass1_ranges(
     spw_key: str,
     corr_key: str,
     grid_shape: tuple[int, int],
+    n_threads: int = 4,
 ) -> tuple[NDArray, NDArray, NDArray]:
     """Discover per-cell min, max, count across all shards.
 
     Returns (cell_min, cell_max, cell_count) as flat 1-D arrays of length
-    N_u * N_v.  Shards are processed sequentially to avoid per-thread
-    dense-array copies.
+    N_u * N_v.  Shard reads run in threads (GIL-releasing I/O + numpy);
+    accumulation into the dense result arrays is main-thread only.
     """
     N_u, N_v = grid_shape
     n_cells = N_u * N_v
@@ -91,19 +98,86 @@ def pass1_ranges(
     cell_max = np.full(n_cells, -np.inf, dtype=np.float64)
     cell_count = np.zeros(n_cells, dtype=np.int64)
 
-    for sp in shard_paths:
-        result = _pass1_one_shard(sp, spw_key, corr_key, N_v)
-        if result is None:
-            continue
-        cells, s_min, s_max, s_count = result
-        np.minimum.at(cell_min, cells, s_min)
-        np.maximum.at(cell_max, cells, s_max)
-        np.add.at(cell_count, cells, s_count)
+    with ThreadPoolExecutor(max_workers=n_threads) as pool:
+        futures = {
+            pool.submit(_pass1_one_shard, sp, spw_key, corr_key, N_v): sp
+            for sp in shard_paths
+        }
+        for fut in as_completed(futures):
+            result = fut.result()
+            if result is None:
+                continue
+            cells, s_min, s_max, s_count = result
+            # Accumulate on main thread (np.minimum.at is not thread-safe).
+            np.minimum.at(cell_min, cells, s_min)
+            np.maximum.at(cell_max, cells, s_max)
+            np.add.at(cell_count, cells, s_count)
 
     return cell_min, cell_max, cell_count
 
 
 # ── Pass 2: chunked histogram fill + extraction ─────────────────
+
+
+def _read_and_bin_shard(
+    shard_path: str,
+    spw_key: str,
+    corr_key: str,
+    cell_to_chunk_idx: NDArray[np.int64],
+    occ_min: NDArray[np.float64],
+    occ_max: NDArray[np.float64],
+    n_bins: int,
+    N_v: int,
+    low_count_mask: NDArray[np.bool_],
+) -> tuple[NDArray, NDArray | None, NDArray | None] | None:
+    """Thread worker: read shard, compute bin assignments.
+
+    Returns (combo, exact_chunk_idx, exact_vals) — lightweight arrays
+    for main-thread accumulation.  All heavy work (zarr I/O, numpy)
+    releases the GIL.
+    """
+    root = zarr.open(shard_path, mode="r")
+    try:
+        grp = root[spw_key][corr_key]
+    except KeyError:
+        return None
+
+    cell_u = grp["cell_u"][:]
+    cell_v = grp["cell_v"][:]
+    values = grp["values"][:].astype(np.float64)
+    if len(values) == 0:
+        return None
+
+    flat_idx = cell_u.astype(np.int64) * N_v + cell_v.astype(np.int64)
+
+    # Filter to values belonging to this chunk's cells.
+    chunk_idx = cell_to_chunk_idx[flat_idx]
+    in_chunk = chunk_idx >= 0
+    if not np.any(in_chunk):
+        return None
+
+    chunk_idx_f = chunk_idx[in_chunk]
+    values_f = values[in_chunk]
+
+    # Bin values.
+    cell_min_v = occ_min[chunk_idx_f]
+    cell_range_v = occ_max[chunk_idx_f] - cell_min_v
+    normalised = (values_f - cell_min_v) / cell_range_v
+    bin_idx = np.floor(normalised * n_bins).astype(np.int64)
+    np.clip(bin_idx, 0, n_bins - 1, out=bin_idx)
+
+    combo = chunk_idx_f.astype(np.int64) * n_bins + bin_idx
+
+    # Extract exact values for low-count cells only.
+    exact_mask = low_count_mask[chunk_idx_f]
+    if np.any(exact_mask):
+        exact_chunk_idx = chunk_idx_f[exact_mask]
+        exact_vals = values_f[exact_mask]
+    else:
+        exact_chunk_idx = None
+        exact_vals = None
+
+    return combo, exact_chunk_idx, exact_vals
 
 
 def _pass2_chunk(
@@ -117,11 +191,12 @@ def _pass2_chunk(
     occ_count: NDArray[np.int64],
     n_bins: int,
     N_v: int,
+    n_threads: int,
 ) -> tuple[NDArray, NDArray, list[NDArray | None]]:
     """Fill histograms and collect exact values for a chunk of occupied cells.
 
-    Processes shards sequentially, accumulating into a single histogram
-    array.  Returns (hist_counts, exact_arrays) for this chunk.
+    Shard reads run in threads; accumulation is main-thread only.
+    Returns (hist_counts, occ_count, exact_arrays) for this chunk.
 
     hist_counts : (n_chunk, n_bins) int32
     """
@@ -130,47 +205,35 @@ def _pass2_chunk(
 
     # Identify which cells need exact collection.
     low_count_mask = occ_count <= _EXACT_THRESHOLD
-    exact_lists: list[list[float]] | None = None
-    if np.any(low_count_mask):
+    has_low_count = np.any(low_count_mask)
+    exact_lists: list[list[float] | None] | None = None
+    if has_low_count:
         exact_lists = [[] if low_count_mask[i] else None for i in range(n_chunk)]
 
-    for sp in shard_paths:
-        root = zarr.open(sp, mode="r")
-        try:
-            grp = root[spw_key][corr_key]
-        except KeyError:
-            continue
+    hist_ravel = hist_counts.ravel()
 
-        cell_u = grp["cell_u"][:]
-        cell_v = grp["cell_v"][:]
-        values = grp["values"][:].astype(np.float64)
-        if len(values) == 0:
-            continue
+    with ThreadPoolExecutor(max_workers=n_threads) as pool:
+        futures = {
+            pool.submit(
+                _read_and_bin_shard, sp, spw_key, corr_key,
+                cell_to_chunk_idx, occ_min, occ_max,
+                n_bins, N_v, low_count_mask,
+            ): sp
+            for sp in shard_paths
+        }
+        for fut in as_completed(futures):
+            result = fut.result()
+            if result is None:
+                continue
+            combo, exact_ci, exact_v = result
 
-        flat_idx = cell_u.astype(np.int64) * N_v + cell_v.astype(np.int64)
+            # Accumulate histogram (main thread only).
+            np.add.at(hist_ravel, combo, 1)
 
-        # Filter to values belonging to this chunk's cells.
-        chunk_idx = cell_to_chunk_idx[flat_idx]
-        in_chunk = chunk_idx >= 0
-        if not np.any(in_chunk):
-            continue
-
-        chunk_idx_f = chunk_idx[in_chunk]
-        values_f = values[in_chunk]
-
-        # Bin values.
-        cell_min_v = occ_min[chunk_idx_f]
-        cell_range_v = occ_max[chunk_idx_f] - cell_min_v
-        normalised = (values_f - cell_min_v) / cell_range_v
-        bin_idx = np.floor(normalised * n_bins).astype(np.int64)
-        np.clip(bin_idx, 0, n_bins - 1, out=bin_idx)
-
-        combo = chunk_idx_f.astype(np.int64) * n_bins + bin_idx
-        np.add.at(hist_counts.ravel(), combo, 1)
-
-        # Collect exact values for low-count cells only.
-        if exact_lists is not None:
-            _collect_exact_filtered(chunk_idx_f, values_f, exact_lists, low_count_mask)
+            # Collect exact values for low-count cells.
+            if exact_ci is not None and exact_lists is not None:
+                for i in range(len(exact_v)):
+                    exact_lists[exact_ci[i]].append(float(exact_v[i]))
 
     # Convert exact lists to arrays.
     exact_arrays: list[NDArray | None] = []
@@ -181,19 +244,6 @@ def _pass2_chunk(
             exact_arrays.append(None)
 
     return hist_counts, occ_count, exact_arrays
-
-
-def _collect_exact_filtered(
-    chunk_idx: NDArray[np.int64],
-    values: NDArray,
-    exact_lists: list[list[float] | None],
-    low_count_mask: NDArray[np.bool_],
-) -> None:
-    """Append values only for cells that need exact computation."""
-    for i in range(len(values)):
-        ci = chunk_idx[i]
-        if low_count_mask[ci]:
-            exact_lists[ci].append(float(values[i]))
 
 
 # ── Extraction ──────────────────────────────────────────────────
@@ -324,16 +374,15 @@ def compute_cell_stats_streaming(
 
     Memory is bounded: occupied cells are processed in chunks sized to
     keep the histogram array under ~2 GB.  Pass 1 uses sparse per-shard
-    results.  The ``n_threads`` parameter is accepted for API compatibility
-    but passes are currently sequential (I/O-dominated, avoids per-thread
-    array copies).
+    results.  Shard reads run in threads (zarr I/O + numpy release the
+    GIL); accumulation into shared arrays is main-thread only.
     """
     N_u, N_v = grid_shape
     n_cells = N_u * N_v
 
     # Pass 1: range discovery.
     cell_min, cell_max, cell_count = pass1_ranges(
-        shard_paths, spw_key, corr_key, grid_shape
+        shard_paths, spw_key, corr_key, grid_shape, n_threads
     )
 
     if cell_count.sum() == 0:
@@ -350,6 +399,9 @@ def compute_cell_stats_streaming(
     occ_min_all = cell_min[occupied_cells].copy()
     occ_max_all = cell_max[occupied_cells].copy()
     occ_count_all = cell_count[occupied_cells]
+
+    # Free dense pass 1 arrays (no longer needed).
+    del cell_min, cell_max, cell_count
 
     # Widen range for constant-value cells.
     equal_mask = occ_min_all == occ_max_all
@@ -376,8 +428,8 @@ def compute_cell_stats_streaming(
     count_grid = np.zeros(n_cells, dtype=np.int32)
 
     # Process occupied cells in chunks.
-    for chunk_idx in range(n_chunks):
-        c_start = chunk_idx * max_cells_per_chunk
+    for chunk_i in range(n_chunks):
+        c_start = chunk_i * max_cells_per_chunk
         c_end = min(c_start + max_cells_per_chunk, n_occupied)
         chunk_cells = occupied_cells[c_start:c_end]
         chunk_min = occ_min_all[c_start:c_end]
@@ -386,7 +438,6 @@ def compute_cell_stats_streaming(
         n_chunk = len(chunk_cells)
 
         # Build cell → chunk-local index mapping.
-        # Use a sparse mapping: only set entries for this chunk's cells.
         cell_to_chunk = np.full(n_cells, -1, dtype=np.int64)
         cell_to_chunk[chunk_cells] = np.arange(n_chunk, dtype=np.int64)
 
@@ -395,10 +446,9 @@ def compute_cell_stats_streaming(
             shard_paths, spw_key, corr_key,
             chunk_cells, cell_to_chunk,
             chunk_min, chunk_max, chunk_count,
-            n_bins, N_v,
+            n_bins, N_v, n_threads,
         )
 
-        # Free the mapping immediately.
         del cell_to_chunk
 
         # Extract stats for this chunk.
