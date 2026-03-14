@@ -14,7 +14,9 @@ Extraction: median and IQR-based robust std from cumulative histograms.
 
 Threading model: shard reads + numpy compute release the GIL and run in
 parallel via ThreadPoolExecutor.  Accumulation into shared arrays is
-done on the main thread only.
+done serially after all I/O completes, with no thread contention.
+JIT kernels (_extract_stats_jit, _segmented_median_mad) use Numba
+parallel=True / prange for multi-core extraction.
 """
 
 from __future__ import annotations
@@ -25,7 +27,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import zarr
-from numba import njit
+from numba import njit, prange
 from numpy.typing import NDArray
 
 from gridflag.gridder import _segmented_median_mad
@@ -232,65 +234,68 @@ def _adaptive_fill_chunk(
     exact_cidx_parts: list[NDArray] = []
     exact_vals_parts: list[NDArray] = []
 
+    # Phase 1: parallel I/O — all shards read concurrently, no accumulation yet.
     with ThreadPoolExecutor(max_workers=n_threads) as pool:
-        futures = {
+        futs = [
             pool.submit(
                 _read_raw_shard, sp, spw_key, corr_key,
                 cell_to_chunk_idx, N_v, low_count_mask, threshold_grid,
-            ): sp
+            )
             for sp in shard_paths
-        }
-        for fut in as_completed(futures):
-            result = fut.result()
-            if result is None:
-                continue
-            chunk_idx_f, values_f, exact_ci, exact_v = result
+        ]
+        shard_results = [f.result() for f in futs]
 
-            # Collect exact values.
-            if exact_ci is not None:
-                exact_cidx_parts.append(exact_ci)
-                exact_vals_parts.append(exact_v)
+    # Phase 2: serial accumulation — no thread contention.
+    for result in shard_results:
+        if result is None:
+            continue
+        chunk_idx_f, values_f, exact_ci, exact_v = result
 
-            # Per-cell min/max for this batch.
-            unique_ci, inv = np.unique(chunk_idx_f, return_inverse=True)
-            batch_lo = np.full(len(unique_ci), np.inf)
-            batch_hi = np.full(len(unique_ci), -np.inf)
-            np.minimum.at(batch_lo, inv, values_f)
-            np.maximum.at(batch_hi, inv, values_f)
+        # Collect exact values.
+        if exact_ci is not None:
+            exact_cidx_parts.append(exact_ci)
+            exact_vals_parts.append(exact_v)
 
-            # Update per-cell ranges; rebin if an existing range expands.
-            # Rebin events are rare (only when a later shard extends the range).
-            for k in range(len(unique_ci)):
-                ci = int(unique_ci[k])
-                b_lo = float(batch_lo[k])
-                b_hi = float(batch_hi[k])
-                if not initialized[ci]:
-                    occ_lo[ci] = b_lo
-                    # Ensure non-zero width for constant-value cells.
-                    occ_hi[ci] = b_hi if b_hi > b_lo else b_lo + 1.0
-                    initialized[ci] = True
-                else:
-                    new_lo = min(occ_lo[ci], b_lo)
-                    new_hi = max(occ_hi[ci], b_hi)
-                    if new_lo < occ_lo[ci] or new_hi > occ_hi[ci]:
-                        hi_safe = new_hi if new_hi > new_lo else new_lo + 1.0
-                        hist_counts[ci] = _rebin_histogram(
-                            hist_counts[ci],
-                            occ_lo[ci], occ_hi[ci],
-                            new_lo, hi_safe,
-                            n_bins,
-                        )
-                        occ_lo[ci] = new_lo
-                        occ_hi[ci] = hi_safe
+        # Per-cell min/max for this batch.
+        unique_ci, inv = np.unique(chunk_idx_f, return_inverse=True)
+        batch_lo = np.full(len(unique_ci), np.inf)
+        batch_hi = np.full(len(unique_ci), -np.inf)
+        np.minimum.at(batch_lo, inv, values_f)
+        np.maximum.at(batch_hi, inv, values_f)
 
-            # Vectorized histogram binning for this shard's batch.
-            lo_f = occ_lo[chunk_idx_f]
-            range_f = occ_hi[chunk_idx_f] - lo_f
-            normalised = (values_f - lo_f) / range_f
-            bin_idx = np.floor(normalised * n_bins).astype(np.int64)
-            np.clip(bin_idx, 0, n_bins - 1, out=bin_idx)
-            combo = chunk_idx_f.astype(np.int64) * n_bins + bin_idx
-            hist_ravel += np.bincount(combo, minlength=n_chunk * n_bins).astype(np.int32)
+        # Update per-cell ranges; rebin if an existing range expands.
+        # Rebin events are rare (only when a later shard extends the range).
+        for k in range(len(unique_ci)):
+            ci = int(unique_ci[k])
+            b_lo = float(batch_lo[k])
+            b_hi = float(batch_hi[k])
+            if not initialized[ci]:
+                occ_lo[ci] = b_lo
+                # Ensure non-zero width for constant-value cells.
+                occ_hi[ci] = b_hi if b_hi > b_lo else b_lo + 1.0
+                initialized[ci] = True
+            else:
+                new_lo = min(occ_lo[ci], b_lo)
+                new_hi = max(occ_hi[ci], b_hi)
+                if new_lo < occ_lo[ci] or new_hi > occ_hi[ci]:
+                    hi_safe = new_hi if new_hi > new_lo else new_lo + 1.0
+                    hist_counts[ci] = _rebin_histogram(
+                        hist_counts[ci],
+                        occ_lo[ci], occ_hi[ci],
+                        new_lo, hi_safe,
+                        n_bins,
+                    )
+                    occ_lo[ci] = new_lo
+                    occ_hi[ci] = hi_safe
+
+        # Vectorized histogram binning for this shard's batch.
+        lo_f = occ_lo[chunk_idx_f]
+        range_f = occ_hi[chunk_idx_f] - lo_f
+        normalised = (values_f - lo_f) / range_f
+        bin_idx = np.floor(normalised * n_bins).astype(np.int64)
+        np.clip(bin_idx, 0, n_bins - 1, out=bin_idx)
+        combo = chunk_idx_f.astype(np.int64) * n_bins + bin_idx
+        hist_ravel += np.bincount(combo, minlength=n_chunk * n_bins).astype(np.int32)
 
     all_exact_cidx = np.concatenate(exact_cidx_parts) if exact_cidx_parts else None
     all_exact_vals = np.concatenate(exact_vals_parts) if exact_vals_parts else None
@@ -301,7 +306,7 @@ def _adaptive_fill_chunk(
 # ── Extraction ───────────────────────────────────────────────────
 
 
-@njit(cache=True)
+@njit(parallel=True, cache=True)
 def _extract_stats_jit(
     hist_counts: np.ndarray,
     occ_min: np.ndarray,
@@ -318,7 +323,7 @@ def _extract_stats_jit(
     medians = np.zeros(n_chunk, dtype=np.float32)
     stds = np.zeros(n_chunk, dtype=np.float32)
 
-    for i in range(n_chunk):
+    for i in prange(n_chunk):
         n = occ_count[i]
         if n == 0:
             continue

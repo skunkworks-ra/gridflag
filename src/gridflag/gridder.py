@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import numpy as np
-from numba import njit
+from numba import njit, prange
 from numpy.typing import NDArray
 
 
-@njit(cache=True)
+@njit(parallel=True, cache=True)
 def _segmented_median_mad(
     vals_sorted: np.ndarray,
     seg_starts: np.ndarray,
@@ -23,7 +23,7 @@ def _segmented_median_mad(
     std_flat = np.zeros(n_cells, dtype=np.float32)
     count_flat = np.zeros(n_cells, dtype=np.int32)
 
-    for i in range(len(seg_starts)):
+    for i in prange(len(seg_starts)):
         s = seg_starts[i]
         n = seg_counts[i]
         cell = unique_cells[i]
