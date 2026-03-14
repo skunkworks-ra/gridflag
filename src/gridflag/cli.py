@@ -11,7 +11,7 @@ CONTEXT_SETTINGS = dict(help_option_names=["-h", "--help"])
 
 
 @click.command(context_settings=CONTEXT_SETTINGS)
-@click.argument("ms_path", type=click.Path(exists=True))
+@click.argument("ms_path", type=click.Path(exists=True), required=False, default=None)
 @click.option("--cell-size", default=10.0, show_default=True, help="Grid cell size in lambda.")
 @click.option("--nsigma", default=3.0, show_default=True, help="Sigma threshold multiplier.")
 @click.option("--smoothing-window", default=5, show_default=True, help="Neighborhood kernel size.")
@@ -61,13 +61,19 @@ CONTEXT_SETTINGS = dict(help_option_names=["-h", "--help"])
     help="Keep the Zarr intermediate store after the run.",
 )
 @click.option(
+    "--plot-cached",
+    default=None,
+    type=click.Path(exists=True),
+    help="Generate plots from an existing Zarr cache (no MS needed).",
+)
+@click.option(
     "--log-level",
     default="INFO",
     show_default=True,
     type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR"]),
 )
 def main(
-    ms_path: str,
+    ms_path: str | None,
     cell_size: float,
     nsigma: float,
     smoothing_window: int,
@@ -81,10 +87,27 @@ def main(
     field_ids: tuple[int, ...],
     plot_dir: str | None,
     persist_cache: bool,
+    plot_cached: str | None,
     log_level: str,
 ) -> None:
     """Run GRIDflag UV-plane RFI flagging on a CASA Measurement Set."""
     setup_logging(log_level)
+
+    # ── Plot-from-cache mode ──────────────────────────────────────
+    if plot_cached is not None:
+        if plot_dir is None:
+            raise click.UsageError("--plot-cached requires --plot-dir")
+        from gridflag.pipeline import plot_from_cache
+
+        paths = plot_from_cache(plot_cached, plot_dir)
+        click.echo(f"Generated {len(paths)} plots from {plot_cached}")
+        if paths:
+            click.echo(f"Plots: {', '.join(paths)}")
+        return
+
+    # ── Normal pipeline mode ──────────────────────────────────────
+    if ms_path is None:
+        raise click.UsageError("MS_PATH is required (unless using --plot-cached)")
 
     # Parse uvrange string.
     parsed_uvrange = None

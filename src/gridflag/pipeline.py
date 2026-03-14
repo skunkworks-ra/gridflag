@@ -557,19 +557,23 @@ def run(
             store.store_grid(spw_id, corr, "flag_mask",
                              np.zeros(gshape, dtype=np.uint8))
 
-            if plot_dir is not None and n_flagged > 0:
+            if (plot_dir is not None or persist_cache) and n_flagged > 0:
                 # Compute "after" grids by streaming with threshold filter.
                 median_after, std_after, _ = compute_cell_stats_streaming(
                     group_shards, spw_key, corr_key, gshape,
                     n_bins=config.n_bins, n_threads=n_stat_threads,
                     threshold_grid=threshold_grid,
                 )
-                grid_cache[(spw_id, corr)] = {
-                    "median_before": median_grid,
-                    "std_before": std_grid,
-                    "median_after": median_after,
-                    "std_after": std_after,
-                }
+                store.store_grid(spw_id, corr, "median_after", median_after)
+                store.store_grid(spw_id, corr, "std_after", std_after)
+
+                if plot_dir is not None:
+                    grid_cache[(spw_id, corr)] = {
+                        "median_before": median_grid,
+                        "std_before": std_grid,
+                        "median_after": median_after,
+                        "std_after": std_after,
+                    }
 
             if flag_results["flag_rows"] is not None:
                 all_flag_rows.append(flag_results["flag_rows"])
@@ -646,3 +650,74 @@ def run(
         "elapsed_s": t_total,
         "plots": plot_paths,
     }
+
+
+def plot_from_cache(
+    zarr_path: str | Path,
+    plot_dir: str | Path,
+) -> list[str]:
+    """Generate diagnostic plots from a persisted Zarr cache.
+
+    Reads median_grid, std_grid, median_after, std_after from the cache
+    and produces before/after comparison PNGs.  No MS access required.
+    """
+    from gridflag.plotting import plot_grids_from_arrays
+    from gridflag.zarr_store import open_readonly
+
+    zarr_path = Path(zarr_path)
+    root = open_readonly(zarr_path)
+
+    config = GridFlagConfig.from_json(root.attrs["config_json"])
+    gshape = tuple(root.attrs["grid_shape"])
+    N_u = gshape[0]
+    global_N = (N_u - 1) // 2
+
+    plot_paths: list[str] = []
+
+    for spw_key in root:
+        if not spw_key.startswith("spw_"):
+            continue
+        spw_id = int(spw_key.split("_")[1])
+        spw_grp = root[spw_key]
+
+        for corr_key in spw_grp:
+            if not corr_key.startswith("corr_"):
+                continue
+            corr_id = int(corr_key.split("_")[1])
+            cgrp = spw_grp[corr_key]
+
+            if "median_grid" not in cgrp or "median_after" not in cgrp:
+                log.info(
+                    "SPW %d corr %d: missing grids, skipping",
+                    spw_id, corr_id,
+                )
+                continue
+
+            median_before = cgrp["median_grid"][:]
+            std_before = cgrp["std_grid"][:]
+            median_after = cgrp["median_after"][:]
+            std_after = cgrp["std_after"][:]
+
+            try:
+                paths = plot_grids_from_arrays(
+                    median_before,
+                    std_before,
+                    median_after,
+                    std_after,
+                    config.cell_size,
+                    global_N,
+                    spw_id,
+                    corr_id,
+                    plot_dir,
+                )
+                plot_paths.extend(str(p) for p in paths)
+            except Exception:
+                log.warning(
+                    "Failed to plot SPW %d corr %d",
+                    spw_id,
+                    corr_id,
+                    exc_info=True,
+                )
+
+    log.info("Generated %d plots from cache %s", len(plot_paths), zarr_path)
+    return plot_paths
