@@ -177,6 +177,53 @@ def plot_before_after(
     return saved
 
 
+def plot_grids_from_arrays(
+    median_before: NDArray,
+    std_before: NDArray,
+    median_after: NDArray,
+    std_after: NDArray,
+    cell_size: float,
+    N: int,
+    spw_id: int,
+    corr_id: int,
+    output_dir: str | Path,
+) -> list[Path]:
+    """Generate before/after plots from pre-computed grid arrays (no per-vis data)."""
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    prefix = f"spw{spw_id}_corr{corr_id}"
+    saved = []
+
+    median_path = output_dir / f"{prefix}_median.png"
+    _plot_comparison(
+        median_before,
+        median_after,
+        "Median (before)",
+        "Median (after)",
+        f"Median grid — SPW {spw_id}, Corr {corr_id}",
+        cell_size,
+        N,
+        median_path,
+    )
+    saved.append(median_path)
+
+    std_path = output_dir / f"{prefix}_std.png"
+    _plot_comparison(
+        std_before,
+        std_after,
+        "Robust σ (before)",
+        "Robust σ (after)",
+        f"Robust σ grid — SPW {spw_id}, Corr {corr_id}",
+        cell_size,
+        N,
+        std_path,
+    )
+    saved.append(std_path)
+
+    return saved
+
+
 def plot_grids_before_after(
     median_before: NDArray,
     std_before: NDArray,

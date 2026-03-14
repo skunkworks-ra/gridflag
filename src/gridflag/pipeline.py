@@ -243,14 +243,13 @@ def _flag_one_shard(
     spw_key: str,
     corr_key: str,
     threshold_grid: np.ndarray,
-    collect_plot_data: bool,
 ) -> dict:
-    """Read one shard, flag visibilities, return flag indices and optional plot data."""
+    """Read one shard, flag visibilities, return flag indices."""
     root = zarr.open(shard_path, mode="r")
     try:
         grp = root[spw_key][corr_key]
     except KeyError:
-        return {"n_flagged": 0, "flag_rows": None, "flag_chans": None, "plot_data": None}
+        return {"n_flagged": 0, "flag_rows": None, "flag_chans": None}
 
     cu = grp["cell_u"][:].astype(np.intp)
     cv = grp["cell_v"][:].astype(np.intp)
@@ -259,7 +258,7 @@ def _flag_one_shard(
     chan_indices = grp["chan_indices"][:]
 
     if len(vals) == 0:
-        return {"n_flagged": 0, "flag_rows": None, "flag_chans": None, "plot_data": None}
+        return {"n_flagged": 0, "flag_rows": None, "flag_chans": None}
 
     flags = flag_visibilities(cu, cv, vals, threshold_grid)
     n_flagged = int(np.sum(flags))
@@ -271,15 +270,10 @@ def _flag_one_shard(
         flag_rows = row_indices[idx]
         flag_chans = chan_indices[idx]
 
-    plot_data = None
-    if collect_plot_data:
-        plot_data = {"cu": cu, "cv": cv, "vals": vals, "flags": flags}
-
     return {
         "n_flagged": n_flagged,
         "flag_rows": flag_rows,
         "flag_chans": flag_chans,
-        "plot_data": plot_data,
     }
 
 
@@ -289,27 +283,19 @@ def _flag_shards(
     corr_key: str,
     threshold_grid: np.ndarray,
     n_threads: int,
-    collect_plot_data: bool = False,
 ) -> dict:
     """Flag visibilities across all shards for one (spw, corr).
 
-    Returns dict with keys: n_flagged, flag_rows, flag_chans, plot_data.
+    Returns dict with keys: n_flagged, flag_rows, flag_chans.
     """
     all_flag_rows: list[np.ndarray] = []
     all_flag_chans: list[np.ndarray] = []
     total_flagged = 0
 
-    # Plot data: concatenated across shards (only when requested).
-    plot_cu: list[np.ndarray] = []
-    plot_cv: list[np.ndarray] = []
-    plot_vals: list[np.ndarray] = []
-    plot_flags: list[np.ndarray] = []
-
     with ThreadPoolExecutor(max_workers=n_threads) as pool:
         futures = {
             pool.submit(
-                _flag_one_shard, sp, spw_key, corr_key,
-                threshold_grid, collect_plot_data,
+                _flag_one_shard, sp, spw_key, corr_key, threshold_grid,
             ): sp
             for sp in shard_paths
         }
@@ -319,27 +305,11 @@ def _flag_shards(
             if result["flag_rows"] is not None:
                 all_flag_rows.append(result["flag_rows"])
                 all_flag_chans.append(result["flag_chans"])
-            if result["plot_data"] is not None:
-                pd = result["plot_data"]
-                plot_cu.append(pd["cu"])
-                plot_cv.append(pd["cv"])
-                plot_vals.append(pd["vals"])
-                plot_flags.append(pd["flags"])
-
-    merged_plot = None
-    if collect_plot_data and plot_cu:
-        merged_plot = {
-            "cu": np.concatenate(plot_cu),
-            "cv": np.concatenate(plot_cv),
-            "vals": np.concatenate(plot_vals),
-            "flags": np.concatenate(plot_flags),
-        }
 
     return {
         "n_flagged": total_flagged,
         "flag_rows": np.concatenate(all_flag_rows) if all_flag_rows else None,
         "flag_chans": np.concatenate(all_flag_chans) if all_flag_chans else None,
-        "plot_data": merged_plot,
     }
 
 
@@ -571,7 +541,7 @@ def run(
             # Streaming flag pass: read each shard, flag, collect results.
             flag_results = _flag_shards(
                 group_shards, spw_key, corr_key, threshold_grid,
-                n_stat_threads, collect_plot_data=(plot_dir is not None),
+                n_stat_threads,
             )
 
             n_flagged = flag_results["n_flagged"]
@@ -587,15 +557,18 @@ def run(
             store.store_grid(spw_id, corr, "flag_mask",
                              np.zeros(gshape, dtype=np.uint8))
 
-            if plot_dir is not None and flag_results["plot_data"]:
-                pd = flag_results["plot_data"]
+            if plot_dir is not None and n_flagged > 0:
+                # Compute "after" grids by streaming with threshold filter.
+                median_after, std_after, _ = compute_cell_stats_streaming(
+                    group_shards, spw_key, corr_key, gshape,
+                    n_bins=config.n_bins, n_threads=n_stat_threads,
+                    threshold_grid=threshold_grid,
+                )
                 grid_cache[(spw_id, corr)] = {
                     "median_before": median_grid,
                     "std_before": std_grid,
-                    "cu": pd["cu"],
-                    "cv": pd["cv"],
-                    "vals": pd["vals"],
-                    "flags": pd["flags"],
+                    "median_after": median_after,
+                    "std_after": std_after,
                 }
 
             if flag_results["flag_rows"] is not None:
@@ -636,18 +609,15 @@ def run(
     # ── Diagnostic plots ────────────────────────────────────────────
     plot_paths: list[str] = []
     if plot_dir is not None and grid_cache:
-        from gridflag.plotting import plot_grids_before_after
+        from gridflag.plotting import plot_grids_from_arrays
 
         for (spw_id, corr), cached in grid_cache.items():
             try:
-                paths = plot_grids_before_after(
+                paths = plot_grids_from_arrays(
                     cached["median_before"],
                     cached["std_before"],
-                    cached["cu"],
-                    cached["cv"],
-                    cached["vals"],
-                    cached["flags"],
-                    gshape,
+                    cached["median_after"],
+                    cached["std_after"],
                     config.cell_size,
                     global_N,
                     spw_id,

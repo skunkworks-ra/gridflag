@@ -43,11 +43,15 @@ def _pass1_one_shard(
     spw_key: str,
     corr_key: str,
     N_v: int,
+    threshold_grid: NDArray | None,
 ) -> tuple[NDArray, NDArray, NDArray, NDArray] | None:
     """Read one shard, return sparse (unique_cells, min, max, count).
 
     Returns None if the shard has no data for this (spw, corr).
     All numpy ops release the GIL.
+
+    If threshold_grid is provided, only values <= their cell's threshold
+    are included (used for computing post-flag "after" grids).
     """
     root = zarr.open(shard_path, mode="r")
     try:
@@ -60,6 +64,16 @@ def _pass1_one_shard(
     values = grp["values"][:]
     if len(values) == 0:
         return None
+
+    # Apply threshold filter if provided.
+    if threshold_grid is not None:
+        thr = threshold_grid[cell_u.astype(np.intp), cell_v.astype(np.intp)]
+        keep = (values <= thr) & ~np.isnan(thr)
+        cell_u = cell_u[keep]
+        cell_v = cell_v[keep]
+        values = values[keep]
+        if len(values) == 0:
+            return None
 
     flat_idx = cell_u.astype(np.int64) * N_v + cell_v.astype(np.int64)
 
@@ -84,12 +98,16 @@ def pass1_ranges(
     corr_key: str,
     grid_shape: tuple[int, int],
     n_threads: int = 4,
+    threshold_grid: NDArray | None = None,
 ) -> tuple[NDArray, NDArray, NDArray]:
     """Discover per-cell min, max, count across all shards.
 
     Returns (cell_min, cell_max, cell_count) as flat 1-D arrays of length
     N_u * N_v.  Shard reads run in threads (GIL-releasing I/O + numpy);
     accumulation into the dense result arrays is main-thread only.
+
+    If threshold_grid is provided, only values passing the threshold are
+    included (for computing post-flag statistics).
     """
     N_u, N_v = grid_shape
     n_cells = N_u * N_v
@@ -100,7 +118,9 @@ def pass1_ranges(
 
     with ThreadPoolExecutor(max_workers=n_threads) as pool:
         futures = {
-            pool.submit(_pass1_one_shard, sp, spw_key, corr_key, N_v): sp
+            pool.submit(
+                _pass1_one_shard, sp, spw_key, corr_key, N_v, threshold_grid,
+            ): sp
             for sp in shard_paths
         }
         for fut in as_completed(futures):
@@ -129,6 +149,7 @@ def _read_and_bin_shard(
     n_bins: int,
     N_v: int,
     low_count_mask: NDArray[np.bool_],
+    threshold_grid: NDArray | None,
 ) -> tuple[NDArray, NDArray | None, NDArray | None] | None:
     """Thread worker: read shard, compute bin assignments.
 
@@ -147,6 +168,16 @@ def _read_and_bin_shard(
     values = grp["values"][:].astype(np.float64)
     if len(values) == 0:
         return None
+
+    # Apply threshold filter if provided.
+    if threshold_grid is not None:
+        thr = threshold_grid[cell_u.astype(np.intp), cell_v.astype(np.intp)]
+        keep = (values <= thr) & ~np.isnan(thr)
+        cell_u = cell_u[keep]
+        cell_v = cell_v[keep]
+        values = values[keep]
+        if len(values) == 0:
+            return None
 
     flat_idx = cell_u.astype(np.int64) * N_v + cell_v.astype(np.int64)
 
@@ -192,6 +223,7 @@ def _pass2_chunk(
     n_bins: int,
     N_v: int,
     n_threads: int,
+    threshold_grid: NDArray | None = None,
 ) -> tuple[NDArray, NDArray, list[NDArray | None]]:
     """Fill histograms and collect exact values for a chunk of occupied cells.
 
@@ -217,7 +249,7 @@ def _pass2_chunk(
             pool.submit(
                 _read_and_bin_shard, sp, spw_key, corr_key,
                 cell_to_chunk_idx, occ_min, occ_max,
-                n_bins, N_v, low_count_mask,
+                n_bins, N_v, low_count_mask, threshold_grid,
             ): sp
             for sp in shard_paths
         }
@@ -366,6 +398,7 @@ def compute_cell_stats_streaming(
     grid_shape: tuple[int, int],
     n_bins: int = 256,
     n_threads: int = 4,
+    threshold_grid: NDArray | None = None,
 ) -> tuple[NDArray, NDArray, NDArray]:
     """Two-pass streaming statistics over zarr shards.
 
@@ -376,13 +409,16 @@ def compute_cell_stats_streaming(
     keep the histogram array under ~2 GB.  Pass 1 uses sparse per-shard
     results.  Shard reads run in threads (zarr I/O + numpy release the
     GIL); accumulation into shared arrays is main-thread only.
+
+    If threshold_grid is provided, only values <= their cell's threshold
+    are included.  Used for computing post-flag "after" grids for plotting.
     """
     N_u, N_v = grid_shape
     n_cells = N_u * N_v
 
     # Pass 1: range discovery.
     cell_min, cell_max, cell_count = pass1_ranges(
-        shard_paths, spw_key, corr_key, grid_shape, n_threads
+        shard_paths, spw_key, corr_key, grid_shape, n_threads, threshold_grid
     )
 
     if cell_count.sum() == 0:
@@ -446,7 +482,7 @@ def compute_cell_stats_streaming(
             shard_paths, spw_key, corr_key,
             chunk_cells, cell_to_chunk,
             chunk_min, chunk_max, chunk_count,
-            n_bins, N_v, n_threads,
+            n_bins, N_v, n_threads, threshold_grid,
         )
 
         del cell_to_chunk
