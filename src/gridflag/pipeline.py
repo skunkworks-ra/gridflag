@@ -520,7 +520,8 @@ def run(
     t_read_start = time.monotonic()
 
     n_workers = config.n_workers if config.n_workers > 0 else available_cpus()
-    n_workers = min(n_workers, 8)  # cap at 8 to avoid CASA lock contention
+    # n_workers is not capped; each worker opens its own casatools.table
+    # via _init_worker so there is no shared-lock contention.
 
     # Memory-budgeted chunk sizing: ensure each worker's peak allocation
     # fits within available RAM.  Per row, a worker holds:
@@ -599,7 +600,8 @@ def run(
     t_compute_start = time.monotonic()
 
     # Thread count for streaming passes (zarr reads + numpy release GIL).
-    n_stat_threads = min(n_workers, 8)
+    # No CASA involvement here, so no reason to cap.
+    n_stat_threads = n_workers
 
     all_flag_rows: list[np.ndarray] = []
     all_flag_chans: list[np.ndarray] = []
