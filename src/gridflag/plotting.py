@@ -23,31 +23,6 @@ def _import_matplotlib():
     return plt
 
 
-def _compute_post_flag_grids(
-    store: ZarrStore,
-    spw_id: int,
-    corr_id: int,
-    grid_shape: tuple[int, int],
-) -> tuple[NDArray, NDArray, NDArray]:
-    """Recompute median/std/count grids after excluding flagged visibilities."""
-    flat = store.load_flat(spw_id, corr_id)
-    flag_arr = store.load_grid(spw_id, corr_id, "flag_mask")
-
-    keep = ~flag_arr.astype(bool)
-    cu = flat["cell_u"][keep].astype(np.intp)
-    cv = flat["cell_v"][keep].astype(np.intp)
-    vals = flat["values"][keep]
-
-    if len(vals) == 0:
-        return (
-            np.full(grid_shape, np.nan, dtype=np.float32),
-            np.full(grid_shape, np.nan, dtype=np.float32),
-            np.zeros(grid_shape, dtype=np.int32),
-        )
-
-    return compute_cell_stats(cu, cv, vals, grid_shape)
-
-
 def _plot_comparison(
     before: NDArray,
     after: NDArray,
@@ -108,12 +83,10 @@ def plot_before_after(
     N: int,
     output_dir: str | Path,
 ) -> list[Path]:
-    """Generate before/after comparison plots for median and std grids.
+    """Generate before/after comparison plots from ZarrStore data.
 
-    Requires that ``flag_mask`` has been stored in the Zarr for this
-    (spw, corr) pair (a 1-D bool array parallel to the flat arrays).
-
-    Returns list of saved file paths.
+    Requires that ``flag_mask``, ``median_grid``, ``std_grid`` have been
+    stored in the Zarr for this (spw, corr) pair.
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -123,9 +96,71 @@ def plot_before_after(
     median_before = store.load_grid(spw_id, corr_id, "median_grid")
     std_before = store.load_grid(spw_id, corr_id, "std_grid")
 
-    median_after, std_after, _ = _compute_post_flag_grids(
-        store, spw_id, corr_id, gshape
+    # Recompute post-flag grids.
+    flat = store.load_flat(spw_id, corr_id)
+    flag_arr = store.load_grid(spw_id, corr_id, "flag_mask")
+    keep = ~flag_arr.astype(bool)
+
+    cu = flat["cell_u"][keep].astype(np.intp)
+    cv = flat["cell_v"][keep].astype(np.intp)
+    vals = flat["values"][keep]
+
+    if len(vals) > 0:
+        median_after, std_after, _ = compute_cell_stats(cu, cv, vals, gshape)
+    else:
+        median_after = np.full(gshape, np.nan, dtype=np.float32)
+        std_after = np.full(gshape, np.nan, dtype=np.float32)
+
+    prefix = f"spw{spw_id}_corr{corr_id}"
+    saved = []
+
+    median_path = output_dir / f"{prefix}_median.png"
+    _plot_comparison(
+        median_before, median_after,
+        "Median (before)", "Median (after)",
+        f"Median grid — SPW {spw_id}, Corr {corr_id}",
+        cell_size, N, median_path,
     )
+    saved.append(median_path)
+
+    std_path = output_dir / f"{prefix}_std.png"
+    _plot_comparison(
+        std_before, std_after,
+        "Robust σ (before)", "Robust σ (after)",
+        f"Robust σ grid — SPW {spw_id}, Corr {corr_id}",
+        cell_size, N, std_path,
+    )
+    saved.append(std_path)
+
+    return saved
+
+
+def plot_grids_before_after(
+    median_before: NDArray,
+    std_before: NDArray,
+    cu: NDArray,
+    cv: NDArray,
+    vals: NDArray,
+    flags: NDArray,
+    gshape: tuple[int, int],
+    cell_size: float,
+    N: int,
+    spw_id: int,
+    corr_id: int,
+    output_dir: str | Path,
+) -> list[Path]:
+    """Generate before/after plots from pre-computed arrays (no Zarr I/O)."""
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    keep = ~flags
+    if np.any(keep):
+        median_after, std_after, _ = compute_cell_stats(
+            cu[keep], cv[keep], vals[keep], gshape,
+        )
+    else:
+        median_after = np.full(gshape, np.nan, dtype=np.float32)
+        std_after = np.full(gshape, np.nan, dtype=np.float32)
 
     prefix = f"spw{spw_id}_corr{corr_id}"
     saved = []

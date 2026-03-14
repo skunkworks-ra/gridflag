@@ -200,32 +200,62 @@ def write_flags(
 
     Returns the number of visibilities newly flagged.
     """
+    return write_flags_batched(ms_path, row_indices, chan_indices, corr_indices)
+
+
+def write_flags_batched(
+    ms_path: str,
+    row_indices: NDArray[np.int64],
+    chan_indices: NDArray[np.int32],
+    corr_indices: NDArray[np.int32],
+    batch_size: int = 10_000,
+) -> int:
+    """Write new flags into the MS FLAG column using batched I/O.
+
+    Reads/writes contiguous row ranges in batches rather than one row
+    at a time.  All entries are flagged (set to True); never unflags.
+
+    Returns the number of visibilities newly flagged.
+    """
+    if len(row_indices) == 0:
+        return 0
+
     casatools = _import_casatools()
     tb = casatools.table()
     tb.open(ms_path, nomodify=False)
     try:
         total_flagged = 0
-        # Group by row for batched writes.
-        unique_rows = np.unique(row_indices)
-        for row in unique_rows:
-            mask = row_indices == row
-            chans = chan_indices[mask]
-            corrs = corr_indices[mask]
-            fvals = flag_values[mask]
 
-            if not np.any(fvals):
+        # Sort by row for contiguous access.
+        order = np.argsort(row_indices)
+        rows = row_indices[order]
+        chans = chan_indices[order]
+        corrs = corr_indices[order]
+
+        # Process in contiguous row batches.
+        min_row = int(rows[0])
+        max_row = int(rows[-1])
+
+        for batch_start in range(min_row, max_row + 1, batch_size):
+            batch_end = min(batch_start + batch_size, max_row + 1)
+            nrow = batch_end - batch_start
+
+            # Find which flag entries fall in this batch.
+            lo = np.searchsorted(rows, batch_start, side="left")
+            hi = np.searchsorted(rows, batch_end, side="left")
+            if lo == hi:
                 continue
 
-            # Read existing flag for this row: (n_corr, n_chan, 1)
-            existing = tb.getcol("FLAG", startrow=int(row), nrow=1)
-            count_before = np.sum(existing)
+            # Read existing flags for this row range: (n_corr, n_chan, nrow).
+            flag_block = tb.getcol("FLAG", startrow=batch_start, nrow=nrow)
+            count_before = int(np.sum(flag_block))
 
-            for c, p, f in zip(chans, corrs, fvals):
-                if f:
-                    existing[int(p), int(c), 0] = True
+            # Vectorized update: set flags using relative row indices.
+            rel_rows = rows[lo:hi] - batch_start
+            flag_block[corrs[lo:hi], chans[lo:hi], rel_rows] = True
 
-            tb.putcol("FLAG", existing, startrow=int(row), nrow=1)
-            total_flagged += int(np.sum(existing) - count_before)
+            tb.putcol("FLAG", flag_block, startrow=batch_start, nrow=nrow)
+            total_flagged += int(np.sum(flag_block)) - count_before
 
         return total_flagged
     finally:

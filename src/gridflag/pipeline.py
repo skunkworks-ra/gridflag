@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import tempfile
+import time
 from pathlib import Path
 
 import numpy as np
@@ -12,9 +13,6 @@ from gridflag.config import GridFlagConfig
 from gridflag.coordinates import (
     C_M_S,
     grid_shape,
-    hermitian_fold,
-    scale_uv,
-    uv_to_cell,
 )
 from gridflag.flagger import flag_visibilities
 from gridflag.gridder import compute_cell_stats
@@ -23,7 +21,7 @@ from gridflag.msio import (
     get_spw_info,
     read_chunks,
     resolve_data_column,
-    write_flags,
+    write_flags_batched,
 )
 from gridflag.thresholds import (
     annular_threshold,
@@ -54,16 +52,11 @@ def _compute_global_N(
     all_spws: list[dict],
     cell_size: float,
 ) -> int:
-    """Determine grid half-size N from antenna positions and channel frequencies.
-
-    ``uv_max = max_baseline_m × max_freq / c``, derived entirely from
-    the ANTENNA and SPECTRAL_WINDOW metadata tables — no visibility read.
-    """
+    """Determine grid half-size N from antenna positions and channel frequencies."""
     max_bl = get_max_baseline_m(ms_path)
     max_freq = max(float(np.max(s["chan_freqs"])) for s in all_spws)
     uv_max = max_bl * max_freq / C_M_S
-    N = int(np.ceil(uv_max / cell_size))
-    return N
+    return int(np.ceil(uv_max / cell_size))
 
 
 def run(
@@ -73,17 +66,16 @@ def run(
 ) -> dict:
     """Run the full GRIDflag pipeline on a measurement set.
 
-    Parameters
-    ----------
-    ms_path : path to CASA Measurement Set.
-    config : algorithm configuration (defaults applied if None).
-    plot_dir : if set, write before/after diagnostic PNGs here.
-
-    Returns a summary dict with flag statistics.
+    Data flow:
+      1. Read MS in chunks → compute UV coords, cell indices → accumulate
+         flat arrays in memory, flush once to Zarr per (spw, corr)
+      2. Per (SPW, corr): load from Zarr → cell stats → thresholds → flags
+      3. Batch-write flags back to MS
     """
     if config is None:
         config = GridFlagConfig()
 
+    t0 = time.monotonic()
     log.info("GRIDflag starting on %s", ms_path)
 
     # Resolve data column.
@@ -104,7 +96,7 @@ def run(
     else:
         uv_min = 0.0
         global_N = _compute_global_N(ms_path, all_spws, config.cell_size)
-        uv_max = global_N * config.cell_size  # effective max
+        uv_max = global_N * config.cell_size
     gshape = grid_shape(global_N)
     log.info("Grid shape: %s  (N=%d)", gshape, global_N)
 
@@ -117,13 +109,16 @@ def run(
     store.set_grid_shape(gshape)
     log.info("Zarr store: %s", zarr_path)
 
-    # ── Pass 1: Read MS → accumulate into Zarr ──────────────────────
+    # ── Pass 1: Read MS → accumulate → flush to Zarr ────────────────
+    t_read_start = time.monotonic()
+
     for spw_info in all_spws:
         spw_id = spw_info["spw_id"]
         n_chan = spw_info["n_chan"]
         n_corr = spw_info["n_corr"]
         ref_freq = spw_info["ref_freq"]
         chan_freqs = np.array(spw_info["chan_freqs"])
+        freq_over_c = chan_freqs / C_M_S  # precompute (n_chan,)
 
         store.init_spw(spw_id, n_chan, n_corr, ref_freq, chan_freqs)
         log.info(
@@ -135,39 +130,77 @@ def run(
             if config.field_ids is not None and chunk.field_id not in config.field_ids:
                 continue
 
-            u_ch, v_ch, _ = scale_uv(chunk.uvw, chan_freqs, ref_freq)
             n_row = chunk.data.shape[0]
+            uvw = chunk.uvw  # (n_row, 3)
+
+            # Per-channel UV in wavelengths: (n_row, n_chan).
+            u_ch = uvw[:, 0:1] * freq_over_c[np.newaxis, :]
+            v_ch = uvw[:, 1:2] * freq_over_c[np.newaxis, :]
+
+            # Hermitian fold (in-place on our local arrays).
+            neg = v_ch < 0
+            u_ch[neg] = -u_ch[neg]
+            v_ch[neg] = -v_ch[neg]
+            # vis conjugation handled per-corr below.
+
+            # Cell assignment with global N.
+            cell_u = (np.rint(u_ch / config.cell_size).astype(np.int32) + global_N)
+            cell_v = np.rint(v_ch / config.cell_size).astype(np.int32)
+
+            # UV distance filter.
+            if uv_min > 0 or config.uvrange is not None:
+                uv_dist_sq = u_ch * u_ch + v_ch * v_ch
+                uv_keep = (uv_dist_sq >= uv_min * uv_min) & (uv_dist_sq <= uv_max * uv_max)
+            else:
+                uv_keep = None
+
+            # Pre-flatten shared arrays (computed once, used per corr).
+            cell_u_flat = cell_u.ravel()
+            cell_v_flat = cell_v.ravel()
+            row_idx = np.repeat(chunk.row_indices, n_chan)
+            chan_idx = np.tile(np.arange(n_chan, dtype=np.int32), n_row)
 
             for corr in range(n_corr):
-                vis_corr = chunk.data[:, :, corr]
-                flag_corr = chunk.flags[:, :, corr]
+                vis_corr = chunk.data[:, :, corr]  # (n_row, n_chan) complex
+                # Conjugate where v was negative.
+                has_neg = np.any(neg)
+                if has_neg:
+                    vis_corr = vis_corr.copy()
+                    vis_corr[neg] = np.conj(vis_corr[neg])
 
-                u_f, v_f, vis_f = hermitian_fold(u_ch, v_ch, vis_corr)
-                cell_u, cell_v, _ = uv_to_cell(u_f, v_f, config.cell_size, N=global_N)
+                vals = _extract_quantity(vis_corr, config.quantity).ravel()
+                flag_corr = chunk.flags[:, :, corr].ravel()
 
-                vals = _extract_quantity(vis_f, config.quantity)
+                # Combined keep mask.
+                keep = ~flag_corr
+                if uv_keep is not None:
+                    keep = keep & uv_keep.ravel()
 
-                row_idx = np.repeat(chunk.row_indices, n_chan)
-                chan_idx = np.tile(np.arange(n_chan, dtype=np.int32), n_row)
+                if not np.any(keep):
+                    continue
 
-                cell_u_flat = cell_u.ravel().astype(np.int32)
-                cell_v_flat = cell_v.ravel().astype(np.int32)
-                vals_flat = vals.ravel()
-
-                keep = ~flag_corr.ravel()
-
-                # UV distance filter.
-                uv_dist = np.sqrt(u_f**2 + v_f**2).ravel()
-                keep &= (uv_dist >= uv_min) & (uv_dist <= uv_max)
                 store.append(
                     spw_id, corr,
                     row_idx[keep], chan_idx[keep],
                     cell_u_flat[keep], cell_v_flat[keep],
-                    vals_flat[keep],
+                    vals[keep],
                 )
 
-    # ── Pass 1.5: Compute statistics and thresholds ─────────────────
-    all_flags: list[dict] = []
+    # Flush all accumulated data to Zarr.
+    store.flush_all()
+
+    t_read = time.monotonic() - t_read_start
+    log.info("Read + accumulate: %.1fs", t_read)
+
+    # ── Pass 1.5: Compute statistics, thresholds, flags ─────────────
+    t_compute_start = time.monotonic()
+
+    all_flag_rows: list[np.ndarray] = []
+    all_flag_chans: list[np.ndarray] = []
+    all_flag_corrs: list[np.ndarray] = []
+
+    # For optional plotting.
+    grid_cache: dict[tuple[int, int], dict] = {}
 
     for spw_info in all_spws:
         spw_id = spw_info["spw_id"]
@@ -175,14 +208,17 @@ def run(
 
         for corr in range(n_corr):
             flat = store.load_flat(spw_id, corr)
-            if len(flat["values"]) == 0:
+            vals = flat["values"]
+            if len(vals) == 0:
                 log.info("SPW %d corr %d: no data, skipping", spw_id, corr)
                 continue
 
             cu = flat["cell_u"].astype(np.intp)
             cv = flat["cell_v"].astype(np.intp)
-            vals = flat["values"]
+            n_total = len(vals)
+            log.info("SPW %d corr %d: %d unflagged visibilities", spw_id, corr, n_total)
 
+            # Per-cell statistics (numba JIT).
             median_grid, std_grid, count_grid = compute_cell_stats(
                 cu, cv, vals, gshape
             )
@@ -190,6 +226,7 @@ def run(
             store.store_grid(spw_id, corr, "std_grid", std_grid)
             store.store_grid(spw_id, corr, "count_grid", count_grid)
 
+            # Thresholds.
             local_thr = local_neighborhood_threshold(
                 median_grid, std_grid, count_grid,
                 config.nsigma, config.smoothing_window,
@@ -205,69 +242,87 @@ def run(
             )
             store.store_grid(spw_id, corr, "threshold_grid", threshold_grid)
 
+            # Flag.
             flags = flag_visibilities(cu, cv, vals, threshold_grid)
             n_flagged = int(np.sum(flags))
-            n_total = len(flags)
             log.info(
                 "SPW %d corr %d: %d / %d flagged (%.2f%%)",
                 spw_id, corr, n_flagged, n_total,
                 100.0 * n_flagged / max(n_total, 1),
             )
 
-            # Store flag mask in Zarr for post-flag grid recomputation.
+            # Store flag mask for plotting.
             store.store_grid(spw_id, corr, "flag_mask", flags.astype(np.uint8))
+
+            if plot_dir is not None:
+                grid_cache[(spw_id, corr)] = {
+                    "median_before": median_grid,
+                    "std_before": std_grid,
+                    "cu": cu, "cv": cv,
+                    "vals": vals, "flags": flags,
+                }
 
             if n_flagged > 0:
                 idx = np.where(flags)[0]
-                all_flags.append({
-                    "row_indices": flat["row_indices"][idx],
-                    "chan_indices": flat["chan_indices"][idx],
-                    "corr_id": corr,
-                    "spw_id": spw_id,
-                    "n_flagged": n_flagged,
-                })
+                all_flag_rows.append(flat["row_indices"][idx])
+                all_flag_chans.append(flat["chan_indices"][idx])
+                all_flag_corrs.append(np.full(n_flagged, corr, dtype=np.int32))
 
-    # ── Pass 2: Write flags back to MS ──────────────────────────────
+    t_compute = time.monotonic() - t_compute_start
+    log.info("Compute: %.1fs", t_compute)
+
+    # ── Pass 2: Batch-write flags back to MS ────────────────────────
+    t_write_start = time.monotonic()
     total_newly_flagged = 0
-    for rec in all_flags:
-        corr_arr = np.full(len(rec["row_indices"]), rec["corr_id"], dtype=np.int32)
-        flag_vals = np.ones(len(rec["row_indices"]), dtype=bool)
-        n = write_flags(
-            ms_path,
-            rec["row_indices"],
-            rec["chan_indices"],
-            corr_arr,
-            flag_vals,
-        )
-        total_newly_flagged += n
 
-    log.info("Total newly flagged: %d", total_newly_flagged)
+    if all_flag_rows:
+        all_rows = np.concatenate(all_flag_rows)
+        all_chans = np.concatenate(all_flag_chans)
+        all_corrs = np.concatenate(all_flag_corrs)
+
+        total_newly_flagged = write_flags_batched(
+            ms_path, all_rows, all_chans, all_corrs,
+        )
+
+    t_write = time.monotonic() - t_write_start
+    log.info("Write: %.1fs", t_write)
+
+    t_total = time.monotonic() - t0
+    log.info("Total newly flagged: %d  (%.1fs total)", total_newly_flagged, t_total)
 
     # ── Diagnostic plots ────────────────────────────────────────────
     plot_paths: list[str] = []
-    if plot_dir is not None:
-        from gridflag.plotting import plot_before_after
+    if plot_dir is not None and grid_cache:
+        from gridflag.plotting import plot_grids_before_after
 
-        for spw_info in all_spws:
-            spw_id = spw_info["spw_id"]
-            for corr in range(spw_info["n_corr"]):
-                try:
-                    paths = plot_before_after(
-                        store, spw_id, corr,
-                        config.cell_size, global_N,
-                        plot_dir,
-                    )
-                    plot_paths.extend(str(p) for p in paths)
-                except Exception:
-                    log.warning(
-                        "Failed to plot SPW %d corr %d", spw_id, corr,
-                        exc_info=True,
-                    )
+        for (spw_id, corr), cached in grid_cache.items():
+            try:
+                paths = plot_grids_before_after(
+                    cached["median_before"],
+                    cached["std_before"],
+                    cached["cu"],
+                    cached["cv"],
+                    cached["vals"],
+                    cached["flags"],
+                    gshape,
+                    config.cell_size,
+                    global_N,
+                    spw_id,
+                    corr,
+                    plot_dir,
+                )
+                plot_paths.extend(str(p) for p in paths)
+            except Exception:
+                log.warning(
+                    "Failed to plot SPW %d corr %d", spw_id, corr,
+                    exc_info=True,
+                )
 
     return {
         "ms_path": ms_path,
         "zarr_path": str(zarr_path),
         "grid_shape": gshape,
         "total_newly_flagged": total_newly_flagged,
+        "elapsed_s": t_total,
         "plots": plot_paths,
     }

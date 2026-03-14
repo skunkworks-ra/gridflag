@@ -3,7 +3,54 @@
 from __future__ import annotations
 
 import numpy as np
+from numba import njit
 from numpy.typing import NDArray
+
+
+@njit(cache=True)
+def _segmented_median_mad(
+    vals_sorted: np.ndarray,
+    seg_starts: np.ndarray,
+    seg_counts: np.ndarray,
+    unique_cells: np.ndarray,
+    n_cells: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Compute median and 1.4826*MAD per segment, scatter into flat grids.
+
+    All arrays are 1-D.  Runs under numba for JIT speed.
+    """
+    median_flat = np.zeros(n_cells, dtype=np.float32)
+    std_flat = np.zeros(n_cells, dtype=np.float32)
+    count_flat = np.zeros(n_cells, dtype=np.int32)
+
+    for i in range(len(seg_starts)):
+        s = seg_starts[i]
+        n = seg_counts[i]
+        cell = unique_cells[i]
+        seg = vals_sorted[s : s + n].copy()
+        seg.sort()
+
+        # Median.
+        if n % 2 == 1:
+            med = seg[n // 2]
+        else:
+            med = (seg[n // 2 - 1] + seg[n // 2]) * 0.5
+
+        # MAD = median(|x - median|).
+        absdev = np.empty(n, dtype=np.float32)
+        for j in range(n):
+            absdev[j] = abs(seg[j] - med)
+        absdev.sort()
+        if n % 2 == 1:
+            mad = absdev[n // 2]
+        else:
+            mad = (absdev[n // 2 - 1] + absdev[n // 2]) * 0.5
+
+        median_flat[cell] = med
+        std_flat[cell] = np.float32(1.4826) * mad
+        count_flat[cell] = n
+
+    return median_flat, std_flat, count_flat
 
 
 def compute_cell_stats(
@@ -27,36 +74,32 @@ def compute_cell_stats(
     count_grid : (N_u, N_v) int32, per-cell visibility count.
     """
     N_u, N_v = grid_shape
-    # Flatten 2D cell indices to 1D for sorting.
-    flat_idx = cell_u.astype(np.int64) * N_v + cell_v.astype(np.int64)
+    n_cells = N_u * N_v
+
+    # Flatten 2D cell indices to 1D.
+    flat_idx = cell_u * N_v + cell_v
 
     # Sort by cell index.
-    order = np.argsort(flat_idx)
+    order = flat_idx.argsort()
     flat_sorted = flat_idx[order]
-    vals_sorted = values[order]
+    vals_sorted = np.ascontiguousarray(values[order], dtype=np.float32)
 
-    # Find segment boundaries.
+    # Segment boundaries.
     unique_cells, seg_starts, seg_counts = np.unique(
         flat_sorted, return_index=True, return_counts=True
     )
 
-    # Allocate output grids.
-    median_grid = np.zeros(N_u * N_v, dtype=np.float32)
-    std_grid = np.zeros(N_u * N_v, dtype=np.float32)
-    count_grid = np.zeros(N_u * N_v, dtype=np.int32)
-
-    for i, (cell, start, cnt) in enumerate(
-        zip(unique_cells, seg_starts, seg_counts)
-    ):
-        seg = vals_sorted[start : start + cnt]
-        med = np.median(seg)
-        mad = np.median(np.abs(seg - med))
-        median_grid[cell] = med
-        std_grid[cell] = 1.4826 * mad
-        count_grid[cell] = cnt
+    # JIT-compiled per-segment statistics.
+    median_flat, std_flat, count_flat = _segmented_median_mad(
+        vals_sorted,
+        seg_starts.astype(np.int64),
+        seg_counts.astype(np.int64),
+        unique_cells.astype(np.int64),
+        n_cells,
+    )
 
     return (
-        median_grid.reshape(grid_shape),
-        std_grid.reshape(grid_shape),
-        count_grid.reshape(grid_shape),
+        median_flat.reshape(grid_shape),
+        std_flat.reshape(grid_shape),
+        count_flat.reshape(grid_shape),
     )
