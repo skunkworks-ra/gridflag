@@ -579,8 +579,7 @@ def run(
 
     # Dispatch workers (persistent table per worker via _init_worker).
     if n_workers > 1:
-        ctx = multiprocessing.get_context("spawn")
-        with ctx.Pool(
+        with multiprocessing.Pool(
             n_workers,
             initializer=_init_worker,
             initargs=(ms_path,),
@@ -621,8 +620,8 @@ def run(
             else:
                 all_pairs.append((group_shards, spw_id_v, corr))
 
-    # Parallelise across (SPW, corr) pairs; cap at 4 to avoid OOM.
-    n_parallel = min(len(all_pairs), 4)
+    # Process pairs serially; Numba prange handles parallelism within each pair.
+    n_parallel = 1
     if n_parallel > 0:
         per_pair_threads = max(1, n_stat_threads // n_parallel)
         with ThreadPoolExecutor(max_workers=n_parallel) as pair_pool:
