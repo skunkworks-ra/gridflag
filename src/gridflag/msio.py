@@ -21,6 +21,24 @@ def available_cpus() -> int:
         return os.cpu_count() or 1
 
 
+def available_memory_gb() -> float:
+    """Return total system RAM in GB."""
+    try:
+        return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 1024**3
+    except (ValueError, OSError):
+        return 8.0  # conservative fallback
+
+
+def get_ms_row_count(ms_path: str) -> int:
+    """Return the total number of rows in the MS main table."""
+    casatools = _import_casatools()
+    tb = casatools.table()
+    tb.open(ms_path, nomodify=True)
+    nrow = tb.nrows()
+    tb.close()
+    return nrow
+
+
 @dataclass
 class MSChunk:
     """A chunk of rows read from an MS."""

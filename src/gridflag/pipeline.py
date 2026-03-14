@@ -21,8 +21,10 @@ from gridflag.flagger import flag_visibilities
 from gridflag.gridder import compute_cell_stats
 from gridflag.msio import (
     available_cpus,
+    available_memory_gb,
     compute_row_chunks,
     get_max_baseline_m,
+    get_ms_row_count,
     get_spw_info,
     resolve_data_column,
     write_flags_batched,
@@ -310,12 +312,30 @@ def run(
     n_workers = config.n_workers if config.n_workers > 0 else available_cpus()
     n_workers = min(n_workers, 8)  # cap at 8 to avoid CASA lock contention
 
-    # Compute non-overlapping row chunks.
-    chunks = compute_row_chunks(ms_path, max(n_workers, 1))
+    # Memory-budgeted chunk sizing: ensure each worker's peak allocation
+    # fits within (total_ram / n_workers).  Per row, a worker holds:
+    #   DATA (complex64: 8B × n_corr × n_chan) + FLAG (1B × n_corr × n_chan)
+    #   + UVW (24B) + derived arrays (~4× DATA for UV, cell, vals)
+    # Conservative multiplier: n_corr × n_chan × 50 bytes/row.
+    max_nchan = max(s["n_chan"] for s in all_spws)
+    max_ncorr = max(s["n_corr"] for s in all_spws)
+    bytes_per_row = max_ncorr * max_nchan * 50
+    total_mem_bytes = available_memory_gb() * 1024**3
+    mem_per_worker = total_mem_bytes / n_workers
+    rows_per_chunk = max(1, int(mem_per_worker / bytes_per_row))
+
+    total_rows = get_ms_row_count(ms_path)
+    npartitions = max(n_workers, int(np.ceil(total_rows / rows_per_chunk)))
+
+    # Compute non-overlapping row chunks (may be more than n_workers).
+    chunks = compute_row_chunks(ms_path, npartitions)
     log.info(
-        "Reading %d chunks with %d workers",
+        "Reading %d rows in %d chunks with %d workers (%.1f GB RAM, %d rows/chunk)",
+        total_rows,
         len(chunks),
         n_workers,
+        total_mem_bytes / 1024**3,
+        rows_per_chunk,
     )
 
     # Temp directory for zarr shards (alongside main store).
