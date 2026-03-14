@@ -313,15 +313,18 @@ def run(
     n_workers = min(n_workers, 8)  # cap at 8 to avoid CASA lock contention
 
     # Memory-budgeted chunk sizing: ensure each worker's peak allocation
-    # fits within (total_ram / n_workers).  Per row, a worker holds:
-    #   DATA (complex64: 8B × n_corr × n_chan) + FLAG (1B × n_corr × n_chan)
-    #   + UVW (24B) + derived arrays (~4× DATA for UV, cell, vals)
-    # Conservative multiplier: n_corr × n_chan × 50 bytes/row.
+    # fits within available RAM.  Per row, a worker holds:
+    #   DATA (complex128 internally in CASA, copied to complex64: ~16B × n_corr × n_chan)
+    #   FLAG (1B × n_corr × n_chan) + UVW (24B)
+    #   + derived arrays (u_ch, v_ch, cell_u, cell_v, vals ~5 × 4-8B × n_chan)
+    #   + CASA internal getcol buffers (another ~1× DATA copy)
+    # Safe multiplier: n_corr × n_chan × 120 bytes/row.
     max_nchan = max(s["n_chan"] for s in all_spws)
     max_ncorr = max(s["n_corr"] for s in all_spws)
-    bytes_per_row = max_ncorr * max_nchan * 50
-    total_mem_bytes = available_memory_gb() * 1024**3
-    mem_per_worker = total_mem_bytes / n_workers
+    bytes_per_row = max_ncorr * max_nchan * 120
+    # Reserve 20% of RAM for OS + main process.
+    usable_mem_bytes = available_memory_gb() * 0.8 * 1024**3
+    mem_per_worker = usable_mem_bytes / n_workers
     rows_per_chunk = max(1, int(mem_per_worker / bytes_per_row))
 
     total_rows = get_ms_row_count(ms_path)
@@ -330,11 +333,11 @@ def run(
     # Compute non-overlapping row chunks (may be more than n_workers).
     chunks = compute_row_chunks(ms_path, npartitions)
     log.info(
-        "Reading %d rows in %d chunks with %d workers (%.1f GB RAM, %d rows/chunk)",
+        "Reading %d rows in %d chunks with %d workers (%.1f GB usable, %d rows/chunk)",
         total_rows,
         len(chunks),
         n_workers,
-        total_mem_bytes / 1024**3,
+        usable_mem_bytes / 1024**3,
         rows_per_chunk,
     )
 
