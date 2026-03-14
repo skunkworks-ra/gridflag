@@ -22,6 +22,7 @@ class GridFlagConfig:
     min_neighbors: int = 3  # fallback to annular if fewer
     spw_ids: tuple[int, ...] | None = None
     field_ids: tuple[int, ...] | None = None
+    uvrange: tuple[float, float] | None = None  # (uv_min, uv_max) in lambda
 
     def to_json(self) -> str:
         return json.dumps(dataclasses.asdict(self))
@@ -30,7 +31,7 @@ class GridFlagConfig:
     def from_json(cls, s: str) -> GridFlagConfig:
         d = json.loads(s)
         # Convert lists back to tuples for frozen fields.
-        for key in ("annulus_widths", "spw_ids", "field_ids"):
+        for key in ("annulus_widths", "spw_ids", "field_ids", "uvrange"):
             if d.get(key) is not None:
                 d[key] = tuple(d[key])
         return cls(**d)

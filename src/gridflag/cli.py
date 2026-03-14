@@ -22,6 +22,8 @@ from gridflag.utils import setup_logging
 @click.option("--chunk-size", default=50_000, help="Rows per MS read chunk.")
 @click.option("--n-readers", default=4, help="Number of parallel reader processes.")
 @click.option("--min-neighbors", default=3, help="Min occupied neighbors for local threshold.")
+@click.option("--uvrange", default=None,
+              help="UV range in lambda as UVMIN,UVMAX (e.g. 100,50000).")
 @click.option("--spw", "spw_ids", multiple=True, type=int, help="SPW IDs to process.")
 @click.option("--field", "field_ids", multiple=True, type=int, help="Field IDs to process.")
 @click.option("--plot-dir", default=None,
@@ -38,6 +40,7 @@ def main(
     zarr_path: str | None,
     chunk_size: int,
     n_readers: int,
+    uvrange: str | None,
     min_neighbors: int,
     spw_ids: tuple[int, ...],
     field_ids: tuple[int, ...],
@@ -46,6 +49,16 @@ def main(
 ) -> None:
     """Run GRIDflag on a CASA Measurement Set."""
     setup_logging(log_level)
+
+    # Parse uvrange string.
+    parsed_uvrange = None
+    if uvrange is not None:
+        parts = uvrange.split(",")
+        if len(parts) != 2:
+            raise click.BadParameter(
+                "Must be two comma-separated values: UVMIN,UVMAX", param_hint="--uvrange"
+            )
+        parsed_uvrange = (float(parts[0]), float(parts[1]))
 
     config = GridFlagConfig(
         cell_size=cell_size,
@@ -59,6 +72,7 @@ def main(
         min_neighbors=min_neighbors,
         spw_ids=spw_ids or None,
         field_ids=field_ids or None,
+        uvrange=parsed_uvrange,
     )
 
     from gridflag.pipeline import run

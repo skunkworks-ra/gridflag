@@ -96,8 +96,15 @@ def run(
         all_spws = [s for s in all_spws if s["spw_id"] in config.spw_ids]
     log.info("Processing %d SPW(s)", len(all_spws))
 
-    # Determine global grid size from metadata (no data scan).
-    global_N = _compute_global_N(ms_path, all_spws, config.cell_size)
+    # Determine global grid size.
+    if config.uvrange is not None:
+        uv_min, uv_max = config.uvrange
+        global_N = int(np.ceil(uv_max / config.cell_size))
+        log.info("UV range: %.1f – %.1f λ (user-specified)", uv_min, uv_max)
+    else:
+        uv_min = 0.0
+        global_N = _compute_global_N(ms_path, all_spws, config.cell_size)
+        uv_max = global_N * config.cell_size  # effective max
     gshape = grid_shape(global_N)
     log.info("Grid shape: %s  (N=%d)", gshape, global_N)
 
@@ -148,6 +155,10 @@ def run(
                 vals_flat = vals.ravel()
 
                 keep = ~flag_corr.ravel()
+
+                # UV distance filter.
+                uv_dist = np.sqrt(u_f**2 + v_f**2).ravel()
+                keep &= (uv_dist >= uv_min) & (uv_dist <= uv_max)
                 store.append(
                     spw_id, corr,
                     row_idx[keep], chan_idx[keep],
