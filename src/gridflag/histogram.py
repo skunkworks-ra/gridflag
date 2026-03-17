@@ -4,17 +4,20 @@ Computes per-cell median and robust std from a consolidated zarr store
 without loading all visibilities into memory at once.
 
 Pass 0 — Count + range discovery: per-cell visibility counts plus
-         per-cell min/max, parallelised over zarr chunks.
+         per-cell min/max.  Zarr chunk reads run in parallel via
+         ThreadPoolExecutor; reduction (bincount / min / max) is serial
+         on the main thread to avoid N×n_cells memory blowup.
 Pass 1 — Fixed-range histogram fill: bin values using pre-computed
-         per-cell ranges (no rebinning).  Parallelised over zarr chunks.
+         per-cell ranges (no rebinning).  Zarr chunk reads are parallel;
+         JIT histogram accumulation is serial into a single shared array
+         (same two-phase pattern — avoids N copies of the histogram).
 Extraction: median and IQR-based robust std from cumulative histograms.
             Low-count cells (≤ _EXACT_THRESHOLD) use exact median/MAD.
 
-Threading model: zarr chunk reads + numpy compute release the GIL and
-run in parallel via ThreadPoolExecutor.  Reduction (sum/min/max) is
-done serially on the main thread.
-JIT kernels (_extract_stats_jit, _segmented_median_mad) use Numba
-parallel=True / prange for multi-core extraction.
+Memory model: at most ONE histogram array of size
+(max_cells_per_chunk × n_bins × 4 bytes) exists.  Workers return only
+compact (flat_idx, values) tuples (~16 MB each for a 1M-element zarr
+chunk), so peak worker memory is n_threads × ~16 MB.
 """
 
 from __future__ import annotations
@@ -44,28 +47,24 @@ _HIST_MEM_BUDGET = 2 * 1024**3  # 2 GB
 # ── Pass 0: count + range discovery ─────────────────────────────
 
 
-def _pass0_one_chunk(
+def _pass0_read_chunk(
     zarr_group: zarr.hierarchy.Group,
     start: int,
     end: int,
     N_v: int,
-    n_cells: int,
     threshold_grid: NDArray | None,
-    skip_counts: bool,
-) -> tuple[NDArray[np.int64], NDArray[np.float64], NDArray[np.float64]]:
-    """Worker: read one zarr chunk, return (counts, mins, maxs)."""
+) -> tuple[NDArray[np.int64], NDArray[np.float64]] | None:
+    """Worker: read one zarr chunk, return compact (flat_idx, values).
+
+    Returns None when the chunk contributes no data.
+    All heavy work (zarr I/O, numpy) releases the GIL.
+    """
     cell_u = zarr_group["cell_u"][start:end]
     cell_v = zarr_group["cell_v"][start:end]
     values = zarr_group["values"][start:end].astype(np.float64)
 
-    zeros = (
-        np.zeros(n_cells, dtype=np.int64),
-        np.full(n_cells, np.inf, dtype=np.float64),
-        np.full(n_cells, -np.inf, dtype=np.float64),
-    )
-
     if len(values) == 0:
-        return zeros
+        return None
 
     if threshold_grid is not None:
         thr = threshold_grid[cell_u.astype(np.intp), cell_v.astype(np.intp)]
@@ -74,21 +73,10 @@ def _pass0_one_chunk(
         cell_v = cell_v[keep]
         values = values[keep]
         if len(values) == 0:
-            return zeros
+            return None
 
     flat_idx = cell_u.astype(np.int64) * N_v + cell_v.astype(np.int64)
-
-    counts = (
-        np.zeros(n_cells, dtype=np.int64) if skip_counts
-        else np.bincount(flat_idx, minlength=n_cells).astype(np.int64)
-    )
-
-    mins = np.full(n_cells, np.inf, dtype=np.float64)
-    maxs = np.full(n_cells, -np.inf, dtype=np.float64)
-    np.minimum.at(mins, flat_idx, values)
-    np.maximum.at(maxs, flat_idx, values)
-
-    return counts, mins, maxs
+    return flat_idx, values
 
 
 def pass0_counts_and_ranges(
@@ -100,9 +88,13 @@ def pass0_counts_and_ranges(
 ) -> tuple[NDArray[np.int64], NDArray[np.float64], NDArray[np.float64]]:
     """Count + min/max per cell over consolidated zarr chunks.
 
+    Two-phase: workers read + filter zarr chunks in parallel (returning
+    compact flat_idx + values); main thread reduces serially (bincount,
+    element-wise min/max).  Peak worker memory is n_threads × ~16 MB.
+
     Returns (cell_count, cell_min, cell_max) — all flat 1-D (n_cells,).
-    When *pre_counts* is provided, bincount is skipped (counts come from
-    the merge step).
+    When *pre_counts* is provided and no threshold filter is active,
+    bincount is skipped.
     """
     N_u, N_v = grid_shape
     n_cells = N_u * N_v
@@ -130,20 +122,26 @@ def pass0_counts_and_ranges(
     cell_min = np.full(n_cells, np.inf, dtype=np.float64)
     cell_max = np.full(n_cells, -np.inf, dtype=np.float64)
 
+    # Phase 1: parallel I/O.  Phase 2: serial reduction.
     with ThreadPoolExecutor(max_workers=n_threads) as pool:
         futures = [
             pool.submit(
-                _pass0_one_chunk, zarr_group, s, e,
-                N_v, n_cells, threshold_grid, skip_counts,
+                _pass0_read_chunk, zarr_group, s, e, N_v, threshold_grid,
             )
             for s, e in chunk_ranges
         ]
         for fut in as_completed(futures):
-            counts_c, mins_c, maxs_c = fut.result()
+            result = fut.result()
+            if result is None:
+                continue
+            flat_idx, values = result
+
             if not skip_counts:
-                cell_count += counts_c
-            np.minimum(cell_min, mins_c, out=cell_min)
-            np.maximum(cell_max, maxs_c, out=cell_max)
+                cell_count += np.bincount(
+                    flat_idx, minlength=n_cells,
+                ).astype(np.int64)
+            np.minimum.at(cell_min, flat_idx, values)
+            np.maximum.at(cell_max, flat_idx, values)
 
     return cell_count, cell_min, cell_max
 
@@ -176,28 +174,26 @@ def _fill_histogram_jit(
         hist_counts[ci, b] += 1
 
 
-def _fill_one_chunk(
+def _read_chunk_for_fill(
     zarr_group: zarr.hierarchy.Group,
     start: int,
     end: int,
     cell_to_chunk_idx: NDArray[np.int64],
     N_v: int,
-    occ_lo: NDArray[np.float64],
-    occ_hi: NDArray[np.float64],
-    n_bins: int,
-    n_chunk: int,
-    low_count_mask: NDArray[np.bool_],
     threshold_grid: NDArray | None,
-) -> tuple[NDArray[np.int32], NDArray | None, NDArray | None]:
-    """Worker: read one zarr chunk, fill fixed-range histogram."""
+) -> tuple[NDArray[np.int64], NDArray[np.float64]] | None:
+    """Worker: read one zarr chunk, filter to current cell chunk.
+
+    Returns compact (chunk_idx_f, values_f) or None.
+    Does NOT allocate any histogram arrays — that happens on the main
+    thread during serial accumulation.
+    """
     cell_u = zarr_group["cell_u"][start:end]
     cell_v = zarr_group["cell_v"][start:end]
     values = zarr_group["values"][start:end].astype(np.float64)
 
-    empty = (np.zeros((n_chunk, n_bins), dtype=np.int32), None, None)
-
     if len(values) == 0:
-        return empty
+        return None
 
     if threshold_grid is not None:
         thr = threshold_grid[cell_u.astype(np.intp), cell_v.astype(np.intp)]
@@ -206,31 +202,15 @@ def _fill_one_chunk(
         cell_v = cell_v[keep]
         values = values[keep]
         if len(values) == 0:
-            return empty
+            return None
 
     flat_idx = cell_u.astype(np.int64) * N_v + cell_v.astype(np.int64)
     chunk_idx = cell_to_chunk_idx[flat_idx]
     in_chunk = chunk_idx >= 0
     if not np.any(in_chunk):
-        return empty
+        return None
 
-    chunk_idx_f = chunk_idx[in_chunk]
-    values_f = values[in_chunk]
-
-    # Collect exact values for low-count cells.
-    exact_mask = low_count_mask[chunk_idx_f]
-    if np.any(exact_mask):
-        exact_ci = chunk_idx_f[exact_mask]
-        exact_v = values_f[exact_mask]
-    else:
-        exact_ci = None
-        exact_v = None
-
-    # Fixed-range histogram fill.
-    hist_local = np.zeros((n_chunk, n_bins), dtype=np.int32)
-    _fill_histogram_jit(chunk_idx_f, values_f, occ_lo, occ_hi, hist_local, n_bins)
-
-    return hist_local, exact_ci, exact_v
+    return chunk_idx[in_chunk], values[in_chunk]
 
 
 def parallel_histogram_fill(
@@ -246,6 +226,11 @@ def parallel_histogram_fill(
     threshold_grid: NDArray | None = None,
 ) -> tuple[NDArray, NDArray, NDArray, NDArray | None, NDArray | None]:
     """Fixed-range parallel histogram fill over zarr chunks.
+
+    Two-phase: workers read + filter zarr chunks in parallel (returning
+    compact chunk_idx + values); main thread accumulates into a single
+    shared histogram array via JIT kernel + collects exact values.
+    Peak memory: ONE histogram array + n_threads × ~16 MB for I/O.
 
     Returns
     -------
@@ -273,26 +258,39 @@ def parallel_histogram_fill(
         for i in range(0, total_len, chunk_size)
     ]
 
+    # Single shared histogram — never duplicated across threads.
     hist_counts = np.zeros((n_chunk, n_bins), dtype=np.int32)
     exact_cidx_parts: list[NDArray] = []
     exact_vals_parts: list[NDArray] = []
 
     _t_io = time.perf_counter()
+
+    # Phase 1: parallel I/O + filter.
+    # Phase 2: serial JIT accumulation as results arrive.
     with ThreadPoolExecutor(max_workers=n_threads) as pool:
         futures = [
             pool.submit(
-                _fill_one_chunk, zarr_group, s, e,
-                cell_to_chunk_idx, N_v, occ_lo, occ_hi,
-                n_bins, n_chunk, low_count_mask, threshold_grid,
+                _read_chunk_for_fill, zarr_group, s, e,
+                cell_to_chunk_idx, N_v, threshold_grid,
             )
             for s, e in chunk_ranges
         ]
         for fut in as_completed(futures):
-            hist_c, exact_ci, exact_v = fut.result()
-            hist_counts += hist_c
-            if exact_ci is not None:
-                exact_cidx_parts.append(exact_ci)
-                exact_vals_parts.append(exact_v)
+            result = fut.result()
+            if result is None:
+                continue
+            chunk_idx_f, values_f = result
+
+            # Collect exact values for low-count cells.
+            exact_mask = low_count_mask[chunk_idx_f]
+            if np.any(exact_mask):
+                exact_cidx_parts.append(chunk_idx_f[exact_mask])
+                exact_vals_parts.append(values_f[exact_mask])
+
+            # JIT fill into shared histogram (serial, no contention).
+            _fill_histogram_jit(
+                chunk_idx_f, values_f, occ_lo, occ_hi, hist_counts, n_bins,
+            )
 
     log.debug("  fill phase: %.3fs (%d zarr chunks, %d threads)",
               time.perf_counter() - _t_io, len(chunk_ranges), n_threads)

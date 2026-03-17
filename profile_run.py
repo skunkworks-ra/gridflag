@@ -59,8 +59,8 @@ def run_with_line_profiler(ms_path: str, n_workers: int):
     import gridflag.pipeline as pipe_mod
 
     lp = LineProfiler()
-    lp.add_function(hist_mod._pass0_one_chunk)
-    lp.add_function(hist_mod._fill_one_chunk)
+    lp.add_function(hist_mod._pass0_read_chunk)
+    lp.add_function(hist_mod._read_chunk_for_fill)
     lp.add_function(hist_mod.parallel_histogram_fill)
     lp.add_function(hist_mod._extract_chunk)
     lp.add_function(hist_mod.compute_cell_stats_streaming)
