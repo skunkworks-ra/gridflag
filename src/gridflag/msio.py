@@ -100,7 +100,7 @@ def resolve_data_column(ms_path: str, data_column: str) -> str:
 def _read_column(tb, col_spec: str, startrow: int, nrow: int) -> NDArray:
     """Read a data column, handling subtraction sentinels.
 
-    Returns data in (n_row, n_chan, n_corr) order (arcae returns row-first).
+    Returns data in (n_row, n_chan, n_corr) order (arcae native shape).
     """
     idx = (slice(startrow, startrow + nrow),)
     if col_spec == "DATA-MODEL":
@@ -200,12 +200,12 @@ def read_chunks(
             # Read the contiguous range then filter to matching rows.
             idx = (slice(start, end),)
             raw = _read_column(tb, data_column, start, end - start)
-            # arcae returns (n_row, n_corr, n_chan) → (n_row, n_chan, n_corr)
+            # arcae returns (n_row, n_chan, n_corr) — already target shape.
             local_mask = spw_mask[start:end]
-            data = raw[local_mask].transpose(0, 2, 1)
+            data = raw[local_mask]
 
             flags_raw = tb.getcol("FLAG", index=idx)
-            flags = flags_raw[local_mask].transpose(0, 2, 1).astype(bool)
+            flags = flags_raw[local_mask].astype(bool)
 
             uvw = tb.getcol("UVW", index=idx)  # (n_row, 3) — no transpose
             uvw = uvw[local_mask]
@@ -327,15 +327,14 @@ def write_flags_batched(
             if lo == hi:
                 continue
 
-            # Read existing flags: arcae returns (nrow, n_corr, n_chan).
+            # Read existing flags: arcae returns (nrow, n_chan, n_corr).
             idx = (slice(batch_start, batch_start + nrow),)
-            flag_block = tb.getcol("FLAG", index=idx)
+            flag_block = np.array(tb.getcol("FLAG", index=idx))
             count_before = int(np.sum(flag_block))
 
             # Vectorized update: set flags using relative row indices.
-            # arcae shape is (nrow, n_corr, n_chan).
             rel_rows = rows[lo:hi] - batch_start
-            flag_block[rel_rows, corrs[lo:hi], chans[lo:hi]] = True
+            flag_block[rel_rows, chans[lo:hi], corrs[lo:hi]] = True
 
             tb.putcol("FLAG", flag_block, index=idx)
             total_flagged += int(np.sum(flag_block)) - count_before

@@ -100,12 +100,12 @@ def _process_chunk_worker(
 
     # Read raw arrays for this row range.
     raw_data = _read_column(tb, data_column, startrow, nrow)
-    # arcae returns (n_row, n_corr, n_chan) → (n_row, n_chan, n_corr)
-    data = raw_data.transpose(0, 2, 1)
+    # arcae returns (n_row, n_chan, n_corr) — already target shape.
+    data = raw_data
 
     idx = (slice(startrow, startrow + nrow),)
     flags_raw = tb.getcol("FLAG", index=idx)
-    flags = flags_raw.transpose(0, 2, 1).astype(bool)  # (n_row, n_corr, n_chan) → (n_row, n_chan, n_corr)
+    flags = flags_raw.astype(bool)
 
     uvw = tb.getcol("UVW", index=idx)  # (n_row, 3) — already row-first
     ddid = tb.getcol("DATA_DESC_ID", index=idx)
