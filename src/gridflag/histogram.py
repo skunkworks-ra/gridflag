@@ -99,6 +99,7 @@ def pass0_counts_and_ranges(
     n_threads: int = 4,
     threshold_grid: NDArray | None = None,
     pre_counts: NDArray[np.int64] | None = None,
+    chunk_cache: list | None = None,
 ) -> tuple[NDArray[np.int64], NDArray[np.float64], NDArray[np.float64]]:
     """Count + min/max per cell over consolidated zarr chunks.
 
@@ -109,6 +110,9 @@ def pass0_counts_and_ranges(
     Returns (cell_count, cell_min, cell_max) — all flat 1-D (n_cells,).
     When *pre_counts* is provided and no threshold filter is active,
     bincount is skipped.
+
+    When *chunk_cache* is a list, (flat_idx, values) tuples are appended
+    so the fill phase can reuse them without re-reading zarr.
     """
     N_u, N_v = grid_shape
     n_cells = N_u * N_v
@@ -155,6 +159,9 @@ def pass0_counts_and_ranges(
                 continue
             flat_idx, values = result
             t_io_total += time.perf_counter() - _t_r
+
+            if chunk_cache is not None:
+                chunk_cache.append((flat_idx, values))
 
             _t_red = time.perf_counter()
             _reduce_pass0_jit(flat_idx, values, cell_count, cell_min, cell_max, skip_counts)
@@ -246,6 +253,7 @@ def parallel_histogram_fill(
     N_v: int,
     n_threads: int,
     threshold_grid: NDArray | None = None,
+    cached_chunks: list | None = None,
 ) -> tuple[NDArray, NDArray, NDArray, NDArray | None, NDArray | None]:
     """Fixed-range parallel histogram fill over zarr chunks.
 
@@ -253,6 +261,9 @@ def parallel_histogram_fill(
     compact chunk_idx + values); main thread accumulates into a single
     shared histogram array via JIT kernel + collects exact values.
     Peak memory: ONE histogram array + n_threads × ~16 MB for I/O.
+
+    When *cached_chunks* is provided (list of (flat_idx, values) from
+    pass0), zarr re-reads are skipped entirely.
 
     Returns
     -------
@@ -273,13 +284,6 @@ def parallel_histogram_fill(
 
     low_count_mask = occ_count <= _EXACT_THRESHOLD
 
-    total_len = zarr_group["values"].shape[0]
-    chunk_size = zarr_group["values"].chunks[0]
-    chunk_ranges = [
-        (i, min(i + chunk_size, total_len))
-        for i in range(0, total_len, chunk_size)
-    ]
-
     # Single shared histogram — never duplicated across threads.
     hist_counts = np.zeros((n_chunk, n_bins), dtype=np.int32)
     exact_cidx_parts: list[NDArray] = []
@@ -287,35 +291,61 @@ def parallel_histogram_fill(
 
     _t_io = time.perf_counter()
 
-    # Phase 1: parallel I/O + filter.
-    # Phase 2: serial JIT accumulation as results arrive.
-    with ThreadPoolExecutor(max_workers=n_threads) as pool:
-        futures = [
-            pool.submit(
-                _read_chunk_for_fill, zarr_group, s, e,
-                cell_to_chunk_idx, N_v, threshold_grid,
-            )
-            for s, e in chunk_ranges
-        ]
-        for fut in as_completed(futures):
-            result = fut.result()
-            if result is None:
+    if cached_chunks is not None:
+        # Fast path: reuse (flat_idx, values) from pass0 — no zarr I/O.
+        for flat_idx, values in cached_chunks:
+            chunk_idx = cell_to_chunk_idx[flat_idx]
+            in_chunk = chunk_idx >= 0
+            if not np.any(in_chunk):
                 continue
-            chunk_idx_f, values_f = result
+            chunk_idx_f = chunk_idx[in_chunk]
+            values_f = values[in_chunk]
 
-            # Collect exact values for low-count cells.
             exact_mask = low_count_mask[chunk_idx_f]
             if np.any(exact_mask):
                 exact_cidx_parts.append(chunk_idx_f[exact_mask])
                 exact_vals_parts.append(values_f[exact_mask])
 
-            # JIT fill into shared histogram (serial, no contention).
             _fill_histogram_jit(
                 chunk_idx_f, values_f, occ_lo, occ_hi, hist_counts, n_bins,
             )
 
-    log.debug("  fill phase: %.3fs (%d zarr reads, %d cells, %d threads)",
-              time.perf_counter() - _t_io, len(chunk_ranges), n_chunk, n_threads)
+        log.debug("  fill phase (cached): %.3fs (%d cached chunks, %d cells)",
+                  time.perf_counter() - _t_io, len(cached_chunks), n_chunk)
+    else:
+        # Standard path: parallel zarr reads + serial JIT accumulation.
+        total_len = zarr_group["values"].shape[0]
+        chunk_size = zarr_group["values"].chunks[0]
+        chunk_ranges = [
+            (i, min(i + chunk_size, total_len))
+            for i in range(0, total_len, chunk_size)
+        ]
+
+        with ThreadPoolExecutor(max_workers=n_threads) as pool:
+            futures = [
+                pool.submit(
+                    _read_chunk_for_fill, zarr_group, s, e,
+                    cell_to_chunk_idx, N_v, threshold_grid,
+                )
+                for s, e in chunk_ranges
+            ]
+            for fut in as_completed(futures):
+                result = fut.result()
+                if result is None:
+                    continue
+                chunk_idx_f, values_f = result
+
+                exact_mask = low_count_mask[chunk_idx_f]
+                if np.any(exact_mask):
+                    exact_cidx_parts.append(chunk_idx_f[exact_mask])
+                    exact_vals_parts.append(values_f[exact_mask])
+
+                _fill_histogram_jit(
+                    chunk_idx_f, values_f, occ_lo, occ_hi, hist_counts, n_bins,
+                )
+
+        log.debug("  fill phase: %.3fs (%d zarr reads, %d cells, %d threads)",
+                  time.perf_counter() - _t_io, len(chunk_ranges), n_chunk, n_threads)
 
     all_exact_cidx = np.concatenate(exact_cidx_parts) if exact_cidx_parts else None
     all_exact_vals = np.concatenate(exact_vals_parts) if exact_vals_parts else None
@@ -475,11 +505,23 @@ def compute_cell_stats_streaming(
     """
     N_u, N_v = grid_shape
     n_cells = N_u * N_v
+    budget = mem_budget_bytes if mem_budget_bytes is not None else _HIST_MEM_BUDGET
+
+    # Decide whether to cache pass0 chunks for fill reuse.
+    # Cache cost: ~16 bytes per visibility (int64 flat_idx + float64 value).
+    total_vis = zarr_group["values"].shape[0] if "values" in zarr_group else 0
+    cache_bytes = total_vis * 16
+    use_cache = cache_bytes < budget * 0.6  # leave room for histogram array
+    chunk_cache: list | None = [] if use_cache else None
+    if use_cache:
+        log.debug("Caching pass0 chunks (est. %.1f GB for %d vis)",
+                  cache_bytes / 1024**3, total_vis)
 
     # Pass 0: count + range discovery.
     _t0 = time.perf_counter()
     cell_count, cell_min, cell_max = pass0_counts_and_ranges(
         zarr_group, grid_shape, n_threads, threshold_grid, pre_counts,
+        chunk_cache=chunk_cache,
     )
     log.debug("Pass0 (counts + ranges): %.3fs", time.perf_counter() - _t0)
 
@@ -501,7 +543,6 @@ def compute_cell_stats_streaming(
     )
 
     # Chunk sizing: keep histogram array under budget.
-    budget = mem_budget_bytes if mem_budget_bytes is not None else _HIST_MEM_BUDGET
     bytes_per_cell = n_bins * 4  # int32
     max_cells_per_chunk = max(1, int(budget / bytes_per_cell))
     n_chunks = math.ceil(n_occupied / max_cells_per_chunk)
@@ -534,6 +575,7 @@ def compute_cell_stats_streaming(
                 zarr_group, chunk_cells, cell_to_chunk,
                 chunk_count, cell_min, cell_max,
                 n_bins, N_v, n_threads, threshold_grid,
+                cached_chunks=chunk_cache,
             )
         )
         log.debug("Chunk %d/%d fill:    %.3fs", chunk_i + 1, n_chunks, time.perf_counter() - _t_fill)
@@ -554,6 +596,8 @@ def compute_cell_stats_streaming(
         count_grid[chunk_cells] = chunk_count.astype(np.int32)
 
         del hist_counts, all_exact_cidx, all_exact_vals
+
+    del chunk_cache  # free cached pass0 data
 
     return (
         median_grid.reshape(grid_shape),

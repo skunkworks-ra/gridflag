@@ -6,6 +6,7 @@ import logging
 import multiprocessing
 import resource
 import shutil
+import sys
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -409,14 +410,13 @@ def _process_spw_corr(
             }
 
     _rss_after = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-    # macOS reports bytes, Linux reports KB
-    import sys
-    _rss_scale = 1 if sys.platform == "linux" else 1024
+    # ru_maxrss: KB on Linux, bytes on macOS
+    _rss_to_mb = 1024 if sys.platform == "linux" else 1024**2
     log.debug(
         "SPW %d corr %d: peak RSS %.1f MB (delta %.1f MB)",
         spw_id, corr,
-        _rss_after / _rss_scale / 1024**2,
-        (_rss_after - _rss_before) / _rss_scale / 1024**2,
+        _rss_after / _rss_to_mb,
+        (_rss_after - _rss_before) / _rss_to_mb,
     )
 
     return {
