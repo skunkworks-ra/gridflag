@@ -12,6 +12,7 @@ from gridflag.gridder import compute_cell_stats
 from gridflag.histogram import (
     _EXACT_THRESHOLD,
     compute_cell_stats_streaming,
+    fused_scatter_and_ranges,
     pass0_counts_and_ranges,
 )
 from gridflag.zarr_store import _FLAT_CHUNK
@@ -66,7 +67,7 @@ class TestPass0CountsAndRanges:
             np.testing.assert_allclose(mins[1 * 2 + 1], 3.0)
             np.testing.assert_allclose(maxs[1 * 2 + 1], 3.0)
 
-    def test_pre_counts_skips_bincount(self):
+    def test_fused_scatter_with_pre_counts(self):
         with tempfile.TemporaryDirectory() as td:
             td_path = Path(td)
             cell_u = np.array([0, 0], dtype=np.int32)
@@ -75,12 +76,16 @@ class TestPass0CountsAndRanges:
             grp = _write_consolidated(td_path / "store.zarr", 0, 0, cell_u, cell_v, values)
 
             pre_counts = np.array([2, 0, 0, 0], dtype=np.int64)
-            counts, mins, maxs = pass0_counts_and_ranges(
-                grp, (2, 2), n_threads=1, pre_counts=pre_counts,
+            sorted_vals, offsets, mins, maxs = fused_scatter_and_ranges(
+                grp, (2, 2), pre_counts, n_threads=1,
             )
-            assert counts[0] == 2
+            assert len(sorted_vals) == 2
+            assert offsets[0] == 0
+            assert offsets[1] == 2  # cell 0 has 2 values
             np.testing.assert_allclose(mins[0], 2.0)
             np.testing.assert_allclose(maxs[0], 10.0)
+            # Scattered values should contain both originals.
+            np.testing.assert_array_equal(sorted(sorted_vals[:2]), [2.0, 10.0])
 
     def test_missing_group_empty(self):
         with tempfile.TemporaryDirectory() as td:
