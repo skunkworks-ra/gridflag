@@ -18,7 +18,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-casa = ["casatools>=6.5"]
+casa = ["arcae>=0.2"]
 dev = [
     "pytest>=7.0",
     "pytest-cov>=4.0",

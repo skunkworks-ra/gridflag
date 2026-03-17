@@ -1,4 +1,4 @@
-"""Measurement Set I/O via casatools."""
+"""Measurement Set I/O via arcae."""
 
 from __future__ import annotations
 
@@ -31,12 +31,9 @@ def available_memory_gb() -> float:
 
 def get_ms_row_count(ms_path: str) -> int:
     """Return the total number of rows in the MS main table."""
-    casatools = _import_casatools()
-    tb = casatools.table()
-    tb.open(ms_path, nomodify=True)
-    nrow = tb.nrows()
-    tb.close()
-    return nrow
+    arcae = _import_arcae()
+    with arcae.table(ms_path, readonly=True) as tb:
+        return tb.nrow()
 
 
 @dataclass
@@ -51,11 +48,11 @@ class MSChunk:
     field_id: int
 
 
-def _import_casatools():
-    """Lazy import of casatools."""
-    import casatools  # type: ignore[import-untyped]
+def _import_arcae():
+    """Lazy import of arcae."""
+    import arcae  # type: ignore[import-untyped]
 
-    return casatools
+    return arcae
 
 
 def resolve_data_column(ms_path: str, data_column: str) -> str:
@@ -70,11 +67,9 @@ def resolve_data_column(ms_path: str, data_column: str) -> str:
     if data_column != "auto":
         return data_column
 
-    casatools = _import_casatools()
-    tb = casatools.table()
-    tb.open(ms_path, nomodify=True)
-    try:
-        cols = tb.colnames()
+    arcae = _import_arcae()
+    with arcae.table(ms_path, readonly=True) as tb:
+        cols = tb.columns()
 
         if "RESIDUAL" in cols:
             log.info("Auto-resolved data column: RESIDUAL")
@@ -83,7 +78,9 @@ def resolve_data_column(ms_path: str, data_column: str) -> str:
         has_model = "MODEL_DATA" in cols
         if has_model:
             # Check if MODEL_DATA is non-zero (sample first chunk).
-            model = tb.getcol("MODEL_DATA", startrow=0, nrow=min(1000, tb.nrows()))
+            nrows = tb.nrow()
+            n_sample = min(1000, nrows)
+            model = tb.getcol("MODEL_DATA", index=(slice(0, n_sample),))
             model_nonzero = np.max(np.abs(model)) > 0.0
         else:
             model_nonzero = False
@@ -98,22 +95,24 @@ def resolve_data_column(ms_path: str, data_column: str) -> str:
 
         log.info("Auto-resolved data column: DATA")
         return "DATA"
-    finally:
-        tb.close()
 
 
 def _read_column(tb, col_spec: str, startrow: int, nrow: int) -> NDArray:
-    """Read a data column, handling subtraction sentinels."""
+    """Read a data column, handling subtraction sentinels.
+
+    Returns data in (n_row, n_chan, n_corr) order (arcae returns row-first).
+    """
+    idx = (slice(startrow, startrow + nrow),)
     if col_spec == "DATA-MODEL":
-        d = tb.getcol("DATA", startrow=startrow, nrow=nrow)
-        m = tb.getcol("MODEL_DATA", startrow=startrow, nrow=nrow)
+        d = tb.getcol("DATA", index=idx)
+        m = tb.getcol("MODEL_DATA", index=idx)
         return d - m
     elif col_spec == "CORRECTED_DATA-MODEL":
-        d = tb.getcol("CORRECTED_DATA", startrow=startrow, nrow=nrow)
-        m = tb.getcol("MODEL_DATA", startrow=startrow, nrow=nrow)
+        d = tb.getcol("CORRECTED_DATA", index=idx)
+        m = tb.getcol("MODEL_DATA", index=idx)
         return d - m
     else:
-        return tb.getcol(col_spec, startrow=startrow, nrow=nrow)
+        return tb.getcol(col_spec, index=idx)
 
 
 # ── Row-range chunking (parallel reads) ─────────────────────────
@@ -126,12 +125,10 @@ def compute_row_chunks(ms_path: str, nchunks: int) -> list[tuple[int, int]]:
     distributes them evenly across *nchunks* chunks so that no
     integration is split across workers.
     """
-    casatools = _import_casatools()
-    tb = casatools.table()
-    tb.open(ms_path, nomodify=True)
-    time_col = tb.getcol("TIME")
-    total_rows = tb.nrows()
-    tb.close()
+    arcae = _import_arcae()
+    with arcae.table(ms_path, readonly=True) as tb:
+        time_col = tb.getcol("TIME")
+        total_rows = tb.nrow()
 
     unique_times, first_indices = np.unique(time_col, return_index=True)
     n_times = len(unique_times)
@@ -182,48 +179,48 @@ def read_chunks(
 ) -> Iterator[MSChunk]:
     """Yield MSChunks for a given SPW by reading the MS in row chunks.
 
-    Uses TAQL to select rows for the desired DATA_DESC_ID (== spw_id for
-    standard MSes).
+    Reads the full table and filters rows by DATA_DESC_ID == spw_id
+    using numpy masking (arcae does not support TAQL subtable queries
+    with rownumbers).
     """
-    casatools = _import_casatools()
-    tb = casatools.table()
-    tb.open(ms_path, nomodify=True)
-    try:
-        # Select rows for this SPW via DATA_DESC_ID.
-        subtb = tb.query(f"DATA_DESC_ID == {spw_id}")
-        n_rows = subtb.nrows()
-        if n_rows == 0:
-            subtb.close()
+    arcae = _import_arcae()
+    with arcae.table(ms_path, readonly=True) as tb:
+        ddid_col = tb.getcol("DATA_DESC_ID")
+        spw_mask = ddid_col == spw_id
+        abs_rows = np.where(spw_mask)[0].astype(np.int64)
+
+        if len(abs_rows) == 0:
             return
 
-        for start in range(0, n_rows, chunk_size):
-            nrow = min(chunk_size, n_rows - start)
-            # casatools getcol returns (n_corr, n_chan, n_row) — transpose.
-            raw = _read_column(subtb, data_column, start, nrow)
-            data = raw.transpose(2, 1, 0)  # → (n_row, n_chan, n_corr)
+        for offset in range(0, len(abs_rows), chunk_size):
+            batch_rows = abs_rows[offset : offset + chunk_size]
+            start = int(batch_rows[0])
+            end = int(batch_rows[-1]) + 1
 
-            flags_raw = subtb.getcol("FLAG", startrow=start, nrow=nrow)
-            flags = flags_raw.transpose(2, 1, 0).astype(bool)
+            # Read the contiguous range then filter to matching rows.
+            idx = (slice(start, end),)
+            raw = _read_column(tb, data_column, start, end - start)
+            # arcae returns (n_row, n_corr, n_chan) → (n_row, n_chan, n_corr)
+            local_mask = spw_mask[start:end]
+            data = raw[local_mask].transpose(0, 2, 1)
 
-            uvw = subtb.getcol("UVW", startrow=start, nrow=nrow).T  # (3, n_row) → (n_row, 3)
+            flags_raw = tb.getcol("FLAG", index=idx)
+            flags = flags_raw[local_mask].transpose(0, 2, 1).astype(bool)
 
-            field_ids = subtb.getcol("FIELD_ID", startrow=start, nrow=nrow)
+            uvw = tb.getcol("UVW", index=idx)  # (n_row, 3) — no transpose
+            uvw = uvw[local_mask]
 
-            # Absolute row numbers for write-back.
-            rownrs = subtb.rownumbers()[start : start + nrow]
+            field_ids = tb.getcol("FIELD_ID", index=idx)
+            field_ids = field_ids[local_mask]
 
             yield MSChunk(
                 data=data,
                 uvw=uvw,
                 flags=flags,
-                row_indices=np.array(rownrs, dtype=np.int64),
+                row_indices=batch_rows,
                 spw_id=spw_id,
                 field_id=int(field_ids[0]),
             )
-
-        subtb.close()
-    finally:
-        tb.close()
 
 
 # ── Metadata helpers ────────────────────────────────────────────
@@ -231,12 +228,9 @@ def read_chunks(
 
 def get_max_baseline_m(ms_path: str) -> float:
     """Return the maximum baseline length in metres from the ANTENNA table."""
-    casatools = _import_casatools()
-    tb = casatools.table()
-    tb.open(f"{ms_path}/ANTENNA", nomodify=True)
-    pos = tb.getcol("POSITION")  # (3, n_ant)
-    tb.close()
-    pos = pos.T  # (n_ant, 3)
+    arcae = _import_arcae()
+    with arcae.table(f"{ms_path}::ANTENNA", readonly=True) as tb:
+        pos = tb.getcol("POSITION")  # (n_ant, 3) — row-first
     # Max pairwise distance.
     from scipy.spatial.distance import pdist
 
@@ -245,30 +239,27 @@ def get_max_baseline_m(ms_path: str) -> float:
 
 def get_spw_info(ms_path: str) -> list[dict]:
     """Return per-SPW metadata: n_chan, n_corr, ref_freq, chan_freqs."""
-    casatools = _import_casatools()
-    tb = casatools.table()
+    arcae = _import_arcae()
 
     # Spectral window table.
-    tb.open(f"{ms_path}/SPECTRAL_WINDOW", nomodify=True)
-    n_spw = tb.nrows()
-    spws = []
-    for i in range(n_spw):
-        chan_freqs = tb.getcol("CHAN_FREQ", startrow=i, nrow=1).flatten()
-        ref_freq = tb.getcol("REF_FREQUENCY", startrow=i, nrow=1).item()
-        spws.append(
-            {
-                "spw_id": i,
-                "n_chan": len(chan_freqs),
-                "ref_freq": ref_freq,
-                "chan_freqs": chan_freqs,
-            }
-        )
-    tb.close()
+    with arcae.table(f"{ms_path}::SPECTRAL_WINDOW", readonly=True) as tb:
+        n_spw = tb.nrow()
+        spws = []
+        for i in range(n_spw):
+            chan_freqs = tb.getcol("CHAN_FREQ", index=(slice(i, i + 1),)).flatten()
+            ref_freq = tb.getcol("REF_FREQUENCY", index=(slice(i, i + 1),)).item()
+            spws.append(
+                {
+                    "spw_id": i,
+                    "n_chan": len(chan_freqs),
+                    "ref_freq": ref_freq,
+                    "chan_freqs": chan_freqs,
+                }
+            )
 
     # Get n_corr from polarization table.
-    tb.open(f"{ms_path}/POLARIZATION", nomodify=True)
-    n_corr = tb.getcol("NUM_CORR", startrow=0, nrow=1).item()
-    tb.close()
+    with arcae.table(f"{ms_path}::POLARIZATION", readonly=True) as tb:
+        n_corr = tb.getcol("NUM_CORR", index=(slice(0, 1),)).item()
     for s in spws:
         s["n_corr"] = n_corr
 
@@ -312,10 +303,8 @@ def write_flags_batched(
     if len(row_indices) == 0:
         return 0
 
-    casatools = _import_casatools()
-    tb = casatools.table()
-    tb.open(ms_path, nomodify=False)
-    try:
+    arcae = _import_arcae()
+    with arcae.table(ms_path, readonly=False) as tb:
         total_flagged = 0
 
         # Sort by row for contiguous access.
@@ -338,17 +327,17 @@ def write_flags_batched(
             if lo == hi:
                 continue
 
-            # Read existing flags for this row range: (n_corr, n_chan, nrow).
-            flag_block = tb.getcol("FLAG", startrow=batch_start, nrow=nrow)
+            # Read existing flags: arcae returns (nrow, n_corr, n_chan).
+            idx = (slice(batch_start, batch_start + nrow),)
+            flag_block = tb.getcol("FLAG", index=idx)
             count_before = int(np.sum(flag_block))
 
             # Vectorized update: set flags using relative row indices.
+            # arcae shape is (nrow, n_corr, n_chan).
             rel_rows = rows[lo:hi] - batch_start
-            flag_block[corrs[lo:hi], chans[lo:hi], rel_rows] = True
+            flag_block[rel_rows, corrs[lo:hi], chans[lo:hi]] = True
 
-            tb.putcol("FLAG", flag_block, startrow=batch_start, nrow=nrow)
+            tb.putcol("FLAG", flag_block, index=idx)
             total_flagged += int(np.sum(flag_block)) - count_before
 
         return total_flagged
-    finally:
-        tb.close()

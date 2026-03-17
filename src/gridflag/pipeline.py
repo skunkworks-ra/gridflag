@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import multiprocessing
 import resource
 import shutil
 import sys
@@ -71,80 +70,46 @@ def _compute_global_N(
 # ── Parallel worker ─────────────────────────────────────────────
 
 
-# ── Persistent pool worker state ────────────────────────────────
-
-_worker_tb = None  # module-level; set once per worker process by _init_worker
-
-
-def _init_worker(ms_path: str) -> None:
-    """Pool initializer: open casatools.table once per worker process."""
-    global _worker_tb
-    import casatools  # type: ignore[import-untyped]
-
-    _worker_tb = casatools.table()
-    _worker_tb.open(ms_path, nomodify=True)
-
-
-def _process_chunk_worker(args: tuple) -> str:
+def _process_chunk_worker(
+    tb,
+    data_column: str,
+    startrow: int,
+    nrow: int,
+    chunk_index: int,
+    shard_dir: str,
+    spw_lookup: dict,
+    global_N: int,
+    cell_size: float,
+    quantity: str,
+    field_ids: list[int] | None,
+    uv_min: float,
+    uv_max: float,
+) -> str:
     """Worker: read a row range from the MS, compute UV/cell/quantity, write zarr shard.
 
-    Each worker uses a persistent casatools.table opened by _init_worker.
+    Uses a shared arcae.table object (thread-safe via ninstances).
     Reads its assigned non-overlapping row range, processes all SPWs/corrs
     found in that range, and writes flat arrays to its own zarr shard.
-
-    Parameters
-    ----------
-    args : tuple
-        (ms_path, data_column, startrow, nrow, chunk_index, shard_dir,
-         spw_lookup, global_N, cell_size, quantity, field_ids,
-         uv_min, uv_max)
 
     Returns
     -------
     str
         Path to the written zarr shard.
     """
-    (
-        ms_path,
-        data_column,
-        startrow,
-        nrow,
-        chunk_index,
-        shard_dir,
-        spw_lookup,
-        global_N,
-        cell_size,
-        quantity,
-        field_ids,
-        uv_min,
-        uv_max,
-    ) = args
-
     from gridflag.msio import _read_column
-
-    # Use persistent worker table if available (pool mode), else open locally.
-    if _worker_tb is not None:
-        tb = _worker_tb
-    else:
-        import casatools  # type: ignore[import-untyped]
-        tb = casatools.table()
-        tb.open(ms_path, nomodify=True)
-    _opened_locally = _worker_tb is None
 
     # Read raw arrays for this row range.
     raw_data = _read_column(tb, data_column, startrow, nrow)
-    # casatools returns (n_corr, n_chan, n_row)
-    data = raw_data.transpose(2, 1, 0)  # → (n_row, n_chan, n_corr)
+    # arcae returns (n_row, n_corr, n_chan) → (n_row, n_chan, n_corr)
+    data = raw_data.transpose(0, 2, 1)
 
-    flags_raw = tb.getcol("FLAG", startrow=startrow, nrow=nrow)
-    flags = flags_raw.transpose(2, 1, 0).astype(bool)
+    idx = (slice(startrow, startrow + nrow),)
+    flags_raw = tb.getcol("FLAG", index=idx)
+    flags = flags_raw.transpose(0, 2, 1).astype(bool)  # (n_row, n_corr, n_chan) → (n_row, n_chan, n_corr)
 
-    uvw = tb.getcol("UVW", startrow=startrow, nrow=nrow).T  # → (n_row, 3)
-    ddid = tb.getcol("DATA_DESC_ID", startrow=startrow, nrow=nrow)
-    field_col = tb.getcol("FIELD_ID", startrow=startrow, nrow=nrow)
-
-    if _opened_locally:
-        tb.close()
+    uvw = tb.getcol("UVW", index=idx)  # (n_row, 3) — already row-first
+    ddid = tb.getcol("DATA_DESC_ID", index=idx)
+    field_col = tb.getcol("FIELD_ID", index=idx)
 
     # Absolute row indices for flag write-back.
     abs_rows = np.arange(startrow, startrow + nrow, dtype=np.int64)
@@ -473,7 +438,7 @@ def run(
         all_spws = [s for s in all_spws if s["spw_id"] in config.spw_ids]
     log.info("Processing %d SPW(s)", len(all_spws))
 
-    # Build SPW lookup for workers (must be picklable).
+    # Build SPW lookup for workers.
     spw_lookup = {
         s["spw_id"]: {
             "n_chan": s["n_chan"],
@@ -550,39 +515,46 @@ def run(
     shard_dir = str(zarr_path.parent / f"tmp_gridflag_shards_{uuid.uuid4().hex[:8]}")
     Path(shard_dir).mkdir(parents=True, exist_ok=True)
 
-    # Build worker args.
+    # Build shared worker kwargs.
     field_ids_list = list(config.field_ids) if config.field_ids is not None else None
-    worker_args = [
-        (
-            ms_path,
-            data_column,
-            startrow,
-            nrow,
-            i,
-            shard_dir,
-            spw_lookup,
-            global_N,
-            config.cell_size,
-            config.quantity,
-            field_ids_list,
-            uv_min,
-            uv_max if config.uvrange is not None else float("inf"),
-        )
-        for i, (startrow, nrow) in enumerate(chunks)
-    ]
+    uv_max_val = uv_max if config.uvrange is not None else float("inf")
+
+    # Open a single shared arcae table for all workers (thread-safe via ninstances).
+    from gridflag.msio import _import_arcae
+
+    arcae = _import_arcae()
+    shared_tb = arcae.table(
+        ms_path, readonly=True, ninstances=n_workers, lockoptions="nolock",
+    )
 
     # ── Read + merge loop ────────────────────────────────────────────
     # Workers write temporary shards; main thread merges each shard
     # into the consolidated store as it arrives, then deletes it.
     all_pre_counts: dict[tuple[int, int], np.ndarray] = {}
 
-    if n_workers > 1:
-        with multiprocessing.Pool(
-            n_workers,
-            initializer=_init_worker,
-            initargs=(ms_path,),
-        ) as pool:
-            for shard_path in pool.imap_unordered(_process_chunk_worker, worker_args):
+    try:
+        with ThreadPoolExecutor(max_workers=n_workers) as pool:
+            futures = {
+                pool.submit(
+                    _process_chunk_worker,
+                    shared_tb,
+                    data_column,
+                    startrow,
+                    nrow,
+                    i,
+                    shard_dir,
+                    spw_lookup,
+                    global_N,
+                    config.cell_size,
+                    config.quantity,
+                    field_ids_list,
+                    uv_min,
+                    uv_max_val,
+                ): i
+                for i, (startrow, nrow) in enumerate(chunks)
+            }
+            for fut in as_completed(futures):
+                shard_path = fut.result()
                 shard_counts = merge_shard_into_consolidated(
                     shard_path, store, N_v, n_cells,
                 )
@@ -592,18 +564,8 @@ def run(
                     else:
                         all_pre_counts[key] = bc
                 shutil.rmtree(shard_path, ignore_errors=True)
-    else:
-        for a in worker_args:
-            shard_path = _process_chunk_worker(a)
-            shard_counts = merge_shard_into_consolidated(
-                shard_path, store, N_v, n_cells,
-            )
-            for key, bc in shard_counts.items():
-                if key in all_pre_counts:
-                    all_pre_counts[key] += bc
-                else:
-                    all_pre_counts[key] = bc
-            shutil.rmtree(shard_path, ignore_errors=True)
+    finally:
+        shared_tb.close()
 
     # Shard directory should be empty now; clean up.
     shutil.rmtree(shard_dir, ignore_errors=True)
