@@ -5,8 +5,15 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+import zarr
+
 from gridflag.config import GridFlagConfig
-from gridflag.zarr_store import AccumulatorGroup, ZarrStore, open_readonly
+from gridflag.zarr_store import (
+    AccumulatorGroup,
+    ZarrStore,
+    merge_shard_into_consolidated,
+    open_readonly,
+)
 
 
 @pytest.fixture
@@ -178,6 +185,109 @@ class TestZarrStore:
 
 
 # ── open_readonly ─────────────────────────────────────────────────
+
+
+class TestMergeShardIntoConsolidated:
+    """Test merge_shard_into_consolidated."""
+
+    def _make_shard(self, path, spw_id, corr_id, cell_u, cell_v, values):
+        """Write a minimal zarr shard."""
+        root = zarr.open(str(path), mode="w")
+        grp = root.require_group(f"spw_{spw_id}/corr_{corr_id}")
+        n = len(values)
+        grp.array("row_indices", np.arange(n, dtype=np.int64))
+        grp.array("chan_indices", np.zeros(n, dtype=np.int32))
+        grp.array("cell_u", cell_u.astype(np.int32))
+        grp.array("cell_v", cell_v.astype(np.int32))
+        grp.array("values", values.astype(np.float32))
+        return str(path)
+
+    def test_three_shards_merge(self, tmp_path):
+        """Merge 3 shards, verify arrays = concatenation of originals."""
+        config = GridFlagConfig()
+        store = ZarrStore(tmp_path / "consolidated.zarr", config, "/fake/test.ms")
+        store.init_spw(0, n_chan=1, n_corr=1, ref_freq=1e9, chan_freqs=np.array([1e9]))
+
+        N_v = 3
+        n_cells = 3 * N_v  # grid_shape = (3, 3)
+
+        # Create 3 shards with different data.
+        all_cu = []
+        all_cv = []
+        all_vals = []
+        all_counts = np.zeros(n_cells, dtype=np.int64)
+
+        for i in range(3):
+            cu = np.array([0, 1, i % 3], dtype=np.int32)
+            cv = np.array([0, 1, 2], dtype=np.int32)
+            vals = np.array([float(i), float(i + 1), float(i + 2)], dtype=np.float32)
+            all_cu.append(cu)
+            all_cv.append(cv)
+            all_vals.append(vals)
+
+            shard_path = self._make_shard(
+                tmp_path / f"shard_{i}.zarr", 0, 0, cu, cv, vals,
+            )
+            counts = merge_shard_into_consolidated(shard_path, store, N_v, n_cells)
+            for key, bc in counts.items():
+                all_counts += bc
+
+        # Clear accumulators to prevent accidental flush.
+        store._accumulators.clear()
+
+        # Verify consolidated arrays.
+        grp = store.root["spw_0/corr_0"]
+        merged_cu = grp["cell_u"][:]
+        merged_cv = grp["cell_v"][:]
+        merged_vals = grp["values"][:]
+
+        expected_cu = np.concatenate(all_cu)
+        expected_cv = np.concatenate(all_cv)
+        expected_vals = np.concatenate(all_vals)
+
+        np.testing.assert_array_equal(merged_cu, expected_cu)
+        np.testing.assert_array_equal(merged_cv, expected_cv)
+        np.testing.assert_array_equal(merged_vals, expected_vals)
+        assert len(merged_vals) == 9
+
+        # Verify counts.
+        assert all_counts.sum() == 9
+
+    def test_empty_shard_skipped(self, tmp_path):
+        """Shard with empty arrays produces no data."""
+        config = GridFlagConfig()
+        store = ZarrStore(tmp_path / "consolidated.zarr", config, "/fake/test.ms")
+        store.init_spw(0, n_chan=1, n_corr=1, ref_freq=1e9, chan_freqs=np.array([1e9]))
+
+        shard_path = self._make_shard(
+            tmp_path / "empty.zarr", 0, 0,
+            np.array([], dtype=np.int32),
+            np.array([], dtype=np.int32),
+            np.array([], dtype=np.float32),
+        )
+        counts = merge_shard_into_consolidated(shard_path, store, 3, 9)
+        assert len(counts) == 0
+
+    def test_multi_spw_corr(self, tmp_path):
+        """Shard with multiple (spw, corr) pairs merges all."""
+        config = GridFlagConfig()
+        store = ZarrStore(tmp_path / "consolidated.zarr", config, "/fake/test.ms")
+        store.init_spw(0, n_chan=1, n_corr=2, ref_freq=1e9, chan_freqs=np.array([1e9]))
+
+        # Create shard with two corrs.
+        shard_path = str(tmp_path / "multi.zarr")
+        root = zarr.open(shard_path, mode="w")
+        for corr in range(2):
+            grp = root.require_group(f"spw_0/corr_{corr}")
+            grp.array("row_indices", np.array([0], dtype=np.int64))
+            grp.array("chan_indices", np.array([0], dtype=np.int32))
+            grp.array("cell_u", np.array([0], dtype=np.int32))
+            grp.array("cell_v", np.array([0], dtype=np.int32))
+            grp.array("values", np.array([float(corr)], dtype=np.float32))
+
+        counts = merge_shard_into_consolidated(shard_path, store, 1, 1)
+        assert (0, 0) in counts
+        assert (0, 1) in counts
 
 
 class TestOpenReadonly:

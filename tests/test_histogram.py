@@ -1,4 +1,4 @@
-"""Tests for gridflag.histogram — streaming two-pass statistics."""
+"""Tests for gridflag.histogram — fixed-range parallel statistics."""
 
 from __future__ import annotations
 
@@ -12,13 +12,13 @@ from gridflag.gridder import compute_cell_stats
 from gridflag.histogram import (
     _EXACT_THRESHOLD,
     compute_cell_stats_streaming,
-    pass0_counts,
+    pass0_counts_and_ranges,
 )
+from gridflag.zarr_store import _FLAT_CHUNK
 
 
-def _write_shard(
-    shard_dir: Path,
-    name: str,
+def _write_consolidated(
+    store_path: Path,
     spw_id: int,
     corr_id: int,
     cell_u: np.ndarray,
@@ -26,68 +26,69 @@ def _write_shard(
     values: np.ndarray,
     row_indices: np.ndarray | None = None,
     chan_indices: np.ndarray | None = None,
-) -> str:
-    """Write a minimal zarr shard for testing."""
-    shard_path = str(shard_dir / f"{name}.zarr")
-    root = zarr.open(shard_path, mode="w")
+) -> zarr.hierarchy.Group:
+    """Write data to a consolidated zarr group for testing."""
+    root = zarr.open(str(store_path), mode="a")
     grp = root.require_group(f"spw_{spw_id}/corr_{corr_id}")
-    grp.array("cell_u", cell_u.astype(np.int32), overwrite=True)
-    grp.array("cell_v", cell_v.astype(np.int32), overwrite=True)
-    grp.array("values", values.astype(np.float32), overwrite=True)
+
     if row_indices is None:
         row_indices = np.arange(len(values), dtype=np.int64)
     if chan_indices is None:
         chan_indices = np.zeros(len(values), dtype=np.int32)
-    grp.array("row_indices", row_indices, overwrite=True)
-    grp.array("chan_indices", chan_indices, overwrite=True)
-    return shard_path
+
+    for name, arr, dtype in [
+        ("cell_u", cell_u, np.int32),
+        ("cell_v", cell_v, np.int32),
+        ("values", values, np.float32),
+        ("row_indices", row_indices, np.int64),
+        ("chan_indices", chan_indices, np.int32),
+    ]:
+        grp.array(name, arr.astype(dtype), chunks=(_FLAT_CHUNK,), overwrite=True)
+
+    return grp
 
 
-class TestPass0Counts:
-    def test_single_shard(self, rng):
+class TestPass0CountsAndRanges:
+    def test_single_group(self, rng):
         with tempfile.TemporaryDirectory() as td:
             td_path = Path(td)
             cell_u = np.array([0, 0, 1], dtype=np.int32)
             cell_v = np.array([0, 0, 1], dtype=np.int32)
             values = np.array([1.0, 5.0, 3.0], dtype=np.float32)
-            sp = _write_shard(td_path, "s0", 0, 0, cell_u, cell_v, values)
+            grp = _write_consolidated(td_path / "store.zarr", 0, 0, cell_u, cell_v, values)
 
             grid_shape = (2, 2)
-            ccount = pass0_counts([sp], "spw_0", "corr_0", grid_shape, n_threads=1)
-            assert ccount[0 * 2 + 0] == 2  # cell (0,0)
-            assert ccount[1 * 2 + 1] == 1  # cell (1,1)
+            counts, mins, maxs = pass0_counts_and_ranges(grp, grid_shape, n_threads=1)
+            assert counts[0 * 2 + 0] == 2  # cell (0,0)
+            assert counts[1 * 2 + 1] == 1  # cell (1,1)
+            np.testing.assert_allclose(mins[0], 1.0)
+            np.testing.assert_allclose(maxs[0], 5.0)
+            np.testing.assert_allclose(mins[1 * 2 + 1], 3.0)
+            np.testing.assert_allclose(maxs[1 * 2 + 1], 3.0)
 
-    def test_two_shards_reduce(self):
+    def test_pre_counts_skips_bincount(self):
         with tempfile.TemporaryDirectory() as td:
             td_path = Path(td)
-            sp1 = _write_shard(
-                td_path, "s0", 0, 0,
-                np.array([0], dtype=np.int32),
-                np.array([0], dtype=np.int32),
-                np.array([10.0], dtype=np.float32),
-            )
-            sp2 = _write_shard(
-                td_path, "s1", 0, 0,
-                np.array([0], dtype=np.int32),
-                np.array([0], dtype=np.int32),
-                np.array([2.0], dtype=np.float32),
-            )
+            cell_u = np.array([0, 0], dtype=np.int32)
+            cell_v = np.array([0, 0], dtype=np.int32)
+            values = np.array([10.0, 2.0], dtype=np.float32)
+            grp = _write_consolidated(td_path / "store.zarr", 0, 0, cell_u, cell_v, values)
 
-            ccount = pass0_counts([sp1, sp2], "spw_0", "corr_0", (1, 1), n_threads=2)
-            assert ccount[0] == 2
+            pre_counts = np.array([2, 0, 0, 0], dtype=np.int64)
+            counts, mins, maxs = pass0_counts_and_ranges(
+                grp, (2, 2), n_threads=1, pre_counts=pre_counts,
+            )
+            assert counts[0] == 2
+            np.testing.assert_allclose(mins[0], 2.0)
+            np.testing.assert_allclose(maxs[0], 10.0)
 
-    def test_missing_group_skipped(self):
+    def test_missing_group_empty(self):
         with tempfile.TemporaryDirectory() as td:
             td_path = Path(td)
-            sp = _write_shard(
-                td_path, "s0", 0, 0,
-                np.array([0], dtype=np.int32),
-                np.array([0], dtype=np.int32),
-                np.array([1.0], dtype=np.float32),
-            )
-            # Ask for a different (spw, corr) → should return zeros.
-            ccount = pass0_counts([sp], "spw_1", "corr_0", (1, 1), n_threads=1)
-            assert ccount[0] == 0
+            root = zarr.open(str(td_path / "store.zarr"), mode="w")
+            grp = root.require_group("spw_1/corr_0")
+            counts, mins, maxs = pass0_counts_and_ranges(grp, (1, 1), n_threads=1)
+            assert counts[0] == 0
 
 
 class TestSingleCellAccuracy:
@@ -99,12 +100,12 @@ class TestSingleCellAccuracy:
             values = np.array([1.0, 2.0, 3.0, 4.0, 5.0], dtype=np.float32)
             cell_u = np.zeros(5, dtype=np.int32)
             cell_v = np.zeros(5, dtype=np.int32)
-            sp = _write_shard(td_path, "s0", 0, 0, cell_u, cell_v, values)
+            grp = _write_consolidated(td_path / "store.zarr", 0, 0, cell_u, cell_v, values)
 
             grid_shape = (1, 1)
             # These are low-count (<=32), so exact fallback kicks in.
             med, std, cnt = compute_cell_stats_streaming(
-                [sp], "spw_0", "corr_0", grid_shape, n_bins=256, n_threads=1
+                grp, grid_shape, n_bins=256, n_threads=1
             )
             assert cnt[0, 0] == 5
             np.testing.assert_allclose(med[0, 0], 3.0)
@@ -116,10 +117,10 @@ class TestSingleCellAccuracy:
             values = np.full(20, 42.0, dtype=np.float32)
             cell_u = np.zeros(20, dtype=np.int32)
             cell_v = np.zeros(20, dtype=np.int32)
-            sp = _write_shard(td_path, "s0", 0, 0, cell_u, cell_v, values)
+            grp = _write_consolidated(td_path / "store.zarr", 0, 0, cell_u, cell_v, values)
 
             med, std, cnt = compute_cell_stats_streaming(
-                [sp], "spw_0", "corr_0", (1, 1), n_bins=256, n_threads=1
+                grp, (1, 1), n_bins=256, n_threads=1
             )
             np.testing.assert_allclose(med[0, 0], 42.0)
             np.testing.assert_allclose(std[0, 0], 0.0)
@@ -130,19 +131,19 @@ class TestSingleCellAccuracy:
             values = np.array([10.0, 20.0], dtype=np.float32)
             cell_u = np.zeros(2, dtype=np.int32)
             cell_v = np.zeros(2, dtype=np.int32)
-            sp = _write_shard(td_path, "s0", 0, 0, cell_u, cell_v, values)
+            grp = _write_consolidated(td_path / "store.zarr", 0, 0, cell_u, cell_v, values)
 
             med, std, cnt = compute_cell_stats_streaming(
-                [sp], "spw_0", "corr_0", (1, 1), n_bins=256, n_threads=1
+                grp, (1, 1), n_bins=256, n_threads=1
             )
             np.testing.assert_allclose(med[0, 0], 15.0)
             np.testing.assert_allclose(std[0, 0], 1.4826 * 5.0, rtol=1e-3)
 
 
-class TestMultiShardAccuracy:
-    """Split data across shards, verify results match single-shard."""
+class TestMultiSourceAccuracy:
+    """Concatenated data from multiple sources, verify results match single source."""
 
-    def test_split_across_two_shards(self, rng):
+    def test_split_data_concatenated(self, rng):
         with tempfile.TemporaryDirectory() as td:
             td_path = Path(td)
             n = 30  # low count → exact fallback
@@ -150,18 +151,16 @@ class TestMultiShardAccuracy:
             cell_v = np.zeros(n, dtype=np.int32)
             values = rng.exponential(1.0, size=n).astype(np.float32)
 
-            # Single shard.
-            sp_all = _write_shard(td_path, "all", 0, 0, cell_u, cell_v, values)
+            # All data in one group.
+            grp = _write_consolidated(td_path / "store.zarr", 0, 0, cell_u, cell_v, values)
             med_all, std_all, cnt_all = compute_cell_stats_streaming(
-                [sp_all], "spw_0", "corr_0", (1, 1), n_bins=256, n_threads=1
+                grp, (1, 1), n_bins=256, n_threads=1
             )
 
-            # Split into two shards.
-            mid = n // 2
-            sp1 = _write_shard(td_path, "s0", 0, 0, cell_u[:mid], cell_v[:mid], values[:mid])
-            sp2 = _write_shard(td_path, "s1", 0, 0, cell_u[mid:], cell_v[mid:], values[mid:])
+            # Same data written again (verifying the consolidated approach).
+            grp2 = _write_consolidated(td_path / "store2.zarr", 0, 0, cell_u, cell_v, values)
             med_split, std_split, cnt_split = compute_cell_stats_streaming(
-                [sp1, sp2], "spw_0", "corr_0", (1, 1), n_bins=256, n_threads=2
+                grp2, (1, 1), n_bins=256, n_threads=2
             )
 
             assert cnt_all[0, 0] == cnt_split[0, 0]
@@ -187,9 +186,12 @@ class TestHistogramVsExact:
             )
 
             # Histogram-based.
-            sp = _write_shard(td_path, "s0", 0, 0, cell_u.astype(np.int32), cell_v.astype(np.int32), values)
+            grp = _write_consolidated(
+                td_path / "store.zarr", 0, 0,
+                cell_u.astype(np.int32), cell_v.astype(np.int32), values,
+            )
             med_hist, std_hist, cnt_hist = compute_cell_stats_streaming(
-                [sp], "spw_0", "corr_0", (1, 1), n_bins=256, n_threads=1
+                grp, (1, 1), n_bins=256, n_threads=1
             )
 
             assert cnt_exact[0, 0] == cnt_hist[0, 0]
@@ -211,22 +213,13 @@ class TestHistogramVsExact:
                 cell_u, cell_v, values, grid_shape
             )
 
-            # Histogram-based (split across 3 shards).
-            chunk = n // 3
-            shards = []
-            for i in range(3):
-                s = i * chunk
-                e = n if i == 2 else (i + 1) * chunk
-                sp = _write_shard(
-                    td_path, f"s{i}", 0, 0,
-                    cell_u[s:e].astype(np.int32),
-                    cell_v[s:e].astype(np.int32),
-                    values[s:e],
-                )
-                shards.append(sp)
-
+            # Histogram-based (single consolidated group).
+            grp = _write_consolidated(
+                td_path / "store.zarr", 0, 0,
+                cell_u.astype(np.int32), cell_v.astype(np.int32), values,
+            )
             med_hist, std_hist, cnt_hist = compute_cell_stats_streaming(
-                shards, "spw_0", "corr_0", grid_shape, n_bins=256, n_threads=2
+                grp, grid_shape, n_bins=256, n_threads=2
             )
 
             np.testing.assert_array_equal(cnt_hist, cnt_exact)
@@ -240,7 +233,6 @@ class TestHistogramVsExact:
             # Std can be 0 for cells with constant values, skip those.
             nonzero_std = occupied & (std_exact > 0)
             if np.any(nonzero_std):
-                # rtol=0.08: histogram binning + IQR vs MAD estimator difference.
                 np.testing.assert_allclose(
                     std_hist[nonzero_std], std_exact[nonzero_std], rtol=0.08,
                     err_msg="Robust std mismatch",
@@ -259,9 +251,12 @@ class TestHistogramVsExact:
                 cell_u, cell_v, values, (1, 1)
             )
 
-            sp = _write_shard(td_path, "s0", 0, 0, cell_u.astype(np.int32), cell_v.astype(np.int32), values)
+            grp = _write_consolidated(
+                td_path / "store.zarr", 0, 0,
+                cell_u.astype(np.int32), cell_v.astype(np.int32), values,
+            )
             med_hist, std_hist, _ = compute_cell_stats_streaming(
-                [sp], "spw_0", "corr_0", (1, 1), n_bins=256, n_threads=1
+                grp, (1, 1), n_bins=256, n_threads=1
             )
 
             np.testing.assert_allclose(med_hist[0, 0], med_exact[0, 0], rtol=0.05)
@@ -269,19 +264,18 @@ class TestHistogramVsExact:
 
 
 class TestEdgeCases:
-    def test_empty_shards(self):
+    def test_empty_group(self):
         """No data at all → zero grids."""
         with tempfile.TemporaryDirectory() as td:
             td_path = Path(td)
-            # Create shard with a different (spw, corr) than what we query.
-            sp = _write_shard(
-                td_path, "s0", 0, 0,
+            grp = _write_consolidated(
+                td_path / "store.zarr", 0, 0,
                 np.array([], dtype=np.int32),
                 np.array([], dtype=np.int32),
                 np.array([], dtype=np.float32),
             )
             med, std, cnt = compute_cell_stats_streaming(
-                [sp], "spw_0", "corr_0", (3, 3), n_bins=256, n_threads=1
+                grp, (3, 3), n_bins=256, n_threads=1
             )
             assert cnt.sum() == 0
             assert med.shape == (3, 3)
@@ -289,14 +283,14 @@ class TestEdgeCases:
     def test_single_value_per_cell(self):
         with tempfile.TemporaryDirectory() as td:
             td_path = Path(td)
-            sp = _write_shard(
-                td_path, "s0", 0, 0,
+            grp = _write_consolidated(
+                td_path / "store.zarr", 0, 0,
                 np.array([0], dtype=np.int32),
                 np.array([0], dtype=np.int32),
                 np.array([7.5], dtype=np.float32),
             )
             med, std, cnt = compute_cell_stats_streaming(
-                [sp], "spw_0", "corr_0", (1, 1), n_bins=256, n_threads=1
+                grp, (1, 1), n_bins=256, n_threads=1
             )
             np.testing.assert_allclose(med[0, 0], 7.5)
             np.testing.assert_allclose(std[0, 0], 0.0)
@@ -310,10 +304,10 @@ class TestEdgeCases:
             values = np.full(n, 42.0, dtype=np.float32)
             cell_u = np.zeros(n, dtype=np.int32)
             cell_v = np.zeros(n, dtype=np.int32)
-            sp = _write_shard(td_path, "s0", 0, 0, cell_u, cell_v, values)
+            grp = _write_consolidated(td_path / "store.zarr", 0, 0, cell_u, cell_v, values)
 
             med, std, cnt = compute_cell_stats_streaming(
-                [sp], "spw_0", "corr_0", (1, 1), n_bins=256, n_threads=1
+                grp, (1, 1), n_bins=256, n_threads=1
             )
             np.testing.assert_allclose(med[0, 0], 42.0, rtol=0.01)
             # Std should be ~0 (all values in one bin).
@@ -323,14 +317,14 @@ class TestEdgeCases:
         with tempfile.TemporaryDirectory() as td:
             td_path = Path(td)
             grid_shape = (5, 3)
-            sp = _write_shard(
-                td_path, "s0", 0, 0,
+            grp = _write_consolidated(
+                td_path / "store.zarr", 0, 0,
                 np.array([0, 1, 2], dtype=np.int32),
                 np.array([0, 0, 0], dtype=np.int32),
                 np.array([1.0, 2.0, 3.0], dtype=np.float32),
             )
             med, std, cnt = compute_cell_stats_streaming(
-                [sp], "spw_0", "corr_0", grid_shape, n_bins=256, n_threads=1
+                grp, grid_shape, n_bins=256, n_threads=1
             )
             assert med.shape == grid_shape
             assert std.shape == grid_shape
@@ -340,78 +334,70 @@ class TestEdgeCases:
             assert cnt.dtype == np.int32
 
 
-class TestAdaptiveRebin:
-    """Verify adaptive range expansion + rebinning across shards."""
+class TestRangeHandling:
+    """Verify fixed-range histograms handle wide value ranges correctly."""
 
-    def test_range_expansion_across_shards(self):
-        """Second shard extends the value range, triggering histogram rebin."""
+    def test_wide_range_data(self):
+        """Data with wide range — fixed-range should handle cleanly."""
         with tempfile.TemporaryDirectory() as td:
             td_path = Path(td)
             rng = np.random.default_rng(0)
 
-            # Shard 1: 100 values in narrow range [2, 4].
+            # Concatenate narrow + wide range data.
             vals1 = rng.uniform(2.0, 4.0, size=100).astype(np.float32)
-            sp1 = _write_shard(
-                td_path, "s0", 0, 0,
-                np.zeros(100, dtype=np.int32),
-                np.zeros(100, dtype=np.int32),
-                vals1,
-            )
-
-            # Shard 2: 100 values extending the range to [0, 8].
             vals2 = rng.uniform(0.0, 8.0, size=100).astype(np.float32)
-            sp2 = _write_shard(
-                td_path, "s1", 0, 0,
-                np.zeros(100, dtype=np.int32),
-                np.zeros(100, dtype=np.int32),
-                vals2,
+            all_vals = np.concatenate([vals1, vals2])
+            n = len(all_vals)
+
+            grp = _write_consolidated(
+                td_path / "store.zarr", 0, 0,
+                np.zeros(n, dtype=np.int32),
+                np.zeros(n, dtype=np.int32),
+                all_vals,
             )
 
             med, std, cnt = compute_cell_stats_streaming(
-                [sp1, sp2], "spw_0", "corr_0", (1, 1), n_bins=256, n_threads=2,
+                grp, (1, 1), n_bins=256, n_threads=2,
             )
 
             assert cnt[0, 0] == 200
 
             # Reference via exact computation.
-            all_vals = np.concatenate([vals1, vals2])
             med_ref, std_ref, _ = compute_cell_stats(
-                np.zeros(200, dtype=np.intp),
-                np.zeros(200, dtype=np.intp),
+                np.zeros(n, dtype=np.intp),
+                np.zeros(n, dtype=np.intp),
                 all_vals, (1, 1),
             )
 
             np.testing.assert_allclose(med[0, 0], med_ref[0, 0], rtol=0.05)
-            # Adaptive rebin introduces additional approximation when shard ranges
-            # differ significantly; allow slightly looser tolerance for std.
             np.testing.assert_allclose(std[0, 0], std_ref[0, 0], rtol=0.10)
 
-    def test_rebin_order_independent(self):
-        """Results are the same regardless of which shard arrives first."""
+    def test_with_pre_counts(self):
+        """Results with pre_counts match results without."""
         with tempfile.TemporaryDirectory() as td:
             td_path = Path(td)
             rng = np.random.default_rng(7)
 
-            vals1 = rng.uniform(0.0, 10.0, size=50).astype(np.float32)
-            vals2 = rng.uniform(-5.0, 15.0, size=50).astype(np.float32)
-            sp1 = _write_shard(
-                td_path, "s0", 0, 0,
-                np.zeros(50, dtype=np.int32), np.zeros(50, dtype=np.int32), vals1,
-            )
-            sp2 = _write_shard(
-                td_path, "s1", 0, 0,
-                np.zeros(50, dtype=np.int32), np.zeros(50, dtype=np.int32), vals2,
+            n = 100
+            values = rng.uniform(-5.0, 15.0, size=n).astype(np.float32)
+            cell_u = np.zeros(n, dtype=np.int32)
+            cell_v = np.zeros(n, dtype=np.int32)
+
+            grp = _write_consolidated(
+                td_path / "store.zarr", 0, 0, cell_u, cell_v, values,
             )
 
-            # Both orderings should produce the same count.
-            med_ab, std_ab, cnt_ab = compute_cell_stats_streaming(
-                [sp1, sp2], "spw_0", "corr_0", (1, 1), n_bins=256, n_threads=1,
-            )
-            med_ba, std_ba, cnt_ba = compute_cell_stats_streaming(
-                [sp2, sp1], "spw_0", "corr_0", (1, 1), n_bins=256, n_threads=1,
+            # Without pre_counts.
+            med_a, std_a, cnt_a = compute_cell_stats_streaming(
+                grp, (1, 1), n_bins=256, n_threads=1,
             )
 
-            assert cnt_ab[0, 0] == cnt_ba[0, 0] == 100
-            # Medians and stds agree within histogram tolerance.
-            np.testing.assert_allclose(med_ab[0, 0], med_ba[0, 0], rtol=0.01)
-            np.testing.assert_allclose(std_ab[0, 0], std_ba[0, 0], rtol=0.01)
+            # With pre_counts.
+            pre_counts = np.array([n], dtype=np.int64)
+            med_b, std_b, cnt_b = compute_cell_stats_streaming(
+                grp, (1, 1), n_bins=256, n_threads=1, pre_counts=pre_counts,
+            )
+
+            assert cnt_a[0, 0] == cnt_b[0, 0] == n
+            np.testing.assert_allclose(med_a[0, 0], med_b[0, 0], rtol=1e-6)
+            np.testing.assert_allclose(std_a[0, 0], std_b[0, 0], rtol=1e-6)

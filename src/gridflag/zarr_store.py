@@ -245,6 +245,64 @@ class ZarrStore:
         return (int(s[0]), int(s[1]))
 
 
+def merge_shard_into_consolidated(
+    shard_path: str,
+    store: ZarrStore,
+    N_v: int,
+    n_cells: int,
+) -> dict[tuple[int, int], NDArray]:
+    """Merge one worker shard into the consolidated zarr store.
+
+    Reads the shard, appends its arrays to the consolidated store per
+    (spw, corr) group via ``append_direct``, and returns per-cell
+    bincounts as a free byproduct.
+
+    Returns
+    -------
+    dict mapping (spw_id, corr_id) → flat bincount array of length n_cells.
+    """
+    root = zarr.open(shard_path, mode="r")
+    counts: dict[tuple[int, int], np.ndarray] = {}
+
+    for spw_key in root:
+        if not spw_key.startswith("spw_"):
+            continue
+        spw_id = int(spw_key.split("_")[1])
+        spw_grp = root[spw_key]
+
+        for corr_key in spw_grp:
+            if not corr_key.startswith("corr_"):
+                continue
+            corr_id = int(corr_key.split("_")[1])
+            grp = spw_grp[corr_key]
+
+            row_indices = grp["row_indices"][:]
+            chan_indices = grp["chan_indices"][:]
+            cell_u = grp["cell_u"][:]
+            cell_v = grp["cell_v"][:]
+            values = grp["values"][:]
+
+            if len(values) == 0:
+                continue
+
+            store.append_direct(
+                spw_id, corr_id, row_indices, chan_indices,
+                cell_u, cell_v, values,
+            )
+
+            # Free byproduct: per-cell counts.
+            flat_idx = cell_u.astype(np.int64) * N_v + cell_v.astype(np.int64)
+            bc = np.bincount(flat_idx, minlength=n_cells).astype(np.int64)
+
+            key = (spw_id, corr_id)
+            if key in counts:
+                counts[key] += bc
+            else:
+                counts[key] = bc
+
+    return counts
+
+
 def open_readonly(path: str | Path) -> zarr.hierarchy.Group:
     """Open an existing Zarr store read-only."""
     return zarr.open(str(path), mode="r")

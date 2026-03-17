@@ -1,20 +1,18 @@
-"""Streaming adaptive histogram-based robust statistics.
+"""Fixed-range parallel histogram-based robust statistics.
 
-Computes per-cell median and robust std from zarr shards without ever
-loading all visibilities into memory at once.
+Computes per-cell median and robust std from a consolidated zarr store
+without loading all visibilities into memory at once.
 
-Pass 0 — Count discovery: per-cell visibility counts (reads only cell
-         indices, skips values for speed when no threshold is applied).
-Pass 1 — Adaptive histogram fill: bin values into per-cell histograms,
-         initialising cell ranges on first data and rebinning on range
-         expansion (rare after the first shard).  Chunked by occupied
-         cells to bound memory.
+Pass 0 — Count + range discovery: per-cell visibility counts plus
+         per-cell min/max, parallelised over zarr chunks.
+Pass 1 — Fixed-range histogram fill: bin values using pre-computed
+         per-cell ranges (no rebinning).  Parallelised over zarr chunks.
 Extraction: median and IQR-based robust std from cumulative histograms.
             Low-count cells (≤ _EXACT_THRESHOLD) use exact median/MAD.
 
-Threading model: shard reads + numpy compute release the GIL and run in
-parallel via ThreadPoolExecutor.  Accumulation into shared arrays is
-done serially after all I/O completes, with no thread contention.
+Threading model: zarr chunk reads + numpy compute release the GIL and
+run in parallel via ThreadPoolExecutor.  Reduction (sum/min/max) is
+done serially on the main thread.
 JIT kernels (_extract_stats_jit, _segmented_median_mad) use Numba
 parallel=True / prange for multi-core extraction.
 """
@@ -43,199 +41,31 @@ _EXACT_THRESHOLD = 32
 _HIST_MEM_BUDGET = 2 * 1024**3  # 2 GB
 
 
-# ── Pass 0: count discovery ──────────────────────────────────────
+# ── Pass 0: count + range discovery ─────────────────────────────
 
 
-def _pass0_one_shard(
-    shard_path: str,
-    spw_key: str,
-    corr_key: str,
+def _pass0_one_chunk(
+    zarr_group: zarr.hierarchy.Group,
+    start: int,
+    end: int,
     N_v: int,
     n_cells: int,
     threshold_grid: NDArray | None,
-) -> NDArray[np.int64]:
-    """Worker: read cell indices, return flat count-per-cell array.
+    skip_counts: bool,
+) -> tuple[NDArray[np.int64], NDArray[np.float64], NDArray[np.float64]]:
+    """Worker: read one zarr chunk, return (counts, mins, maxs)."""
+    cell_u = zarr_group["cell_u"][start:end]
+    cell_v = zarr_group["cell_v"][start:end]
+    values = zarr_group["values"][start:end].astype(np.float64)
 
-    When threshold_grid is None, values are not read (faster I/O).
-    When threshold_grid is provided, values are read to apply the filter.
-    """
-    root = zarr.open(shard_path, mode="r")
-    try:
-        grp = root[spw_key][corr_key]
-    except KeyError:
-        return np.zeros(n_cells, dtype=np.int64)
+    zeros = (
+        np.zeros(n_cells, dtype=np.int64),
+        np.full(n_cells, np.inf, dtype=np.float64),
+        np.full(n_cells, -np.inf, dtype=np.float64),
+    )
 
-    cell_u = grp["cell_u"][:]
-    cell_v = grp["cell_v"][:]
-    if len(cell_u) == 0:
-        return np.zeros(n_cells, dtype=np.int64)
-
-    if threshold_grid is not None:
-        values = grp["values"][:]
-        thr = threshold_grid[cell_u.astype(np.intp), cell_v.astype(np.intp)]
-        keep = (values <= thr) & ~np.isnan(thr)
-        cell_u = cell_u[keep]
-        cell_v = cell_v[keep]
-        if len(cell_u) == 0:
-            return np.zeros(n_cells, dtype=np.int64)
-
-    flat_idx = cell_u.astype(np.int64) * N_v + cell_v.astype(np.int64)
-    return np.bincount(flat_idx, minlength=n_cells).astype(np.int64)
-
-
-def pass0_counts(
-    shard_paths: list[str],
-    spw_key: str,
-    corr_key: str,
-    grid_shape: tuple[int, int],
-    n_threads: int = 4,
-    threshold_grid: NDArray | None = None,
-) -> NDArray[np.int64]:
-    """Count visibilities per cell across all shards.
-
-    Returns cell_count: flat 1-D array of length N_u * N_v.
-    When threshold_grid is None, value arrays are skipped for faster I/O.
-    """
-    N_u, N_v = grid_shape
-    n_cells = N_u * N_v
-    cell_count = np.zeros(n_cells, dtype=np.int64)
-
-    with ThreadPoolExecutor(max_workers=n_threads) as pool:
-        futures = {
-            pool.submit(
-                _pass0_one_shard, sp, spw_key, corr_key, N_v, n_cells, threshold_grid,
-            ): sp
-            for sp in shard_paths
-        }
-        for fut in as_completed(futures):
-            cell_count += fut.result()
-
-    return cell_count
-
-
-# ── Adaptive histogram fill ──────────────────────────────────────
-
-
-@njit(cache=True)
-def _rebin_histogram(
-    hist_row: np.ndarray,
-    old_lo: float,
-    old_hi: float,
-    new_lo: float,
-    new_hi: float,
-    n_bins: int,
-) -> np.ndarray:
-    """Redistribute one cell's histogram counts into a wider range. O(n_bins)."""
-    new_hist = np.zeros(n_bins, dtype=hist_row.dtype)
-    old_width = (old_hi - old_lo) / n_bins
-    new_width = (new_hi - new_lo) / n_bins
-    for b in range(n_bins):
-        if hist_row[b] == 0:
-            continue
-        center = old_lo + (b + 0.5) * old_width
-        new_b = int((center - new_lo) / new_width)
-        if new_b < 0:
-            new_b = 0
-        elif new_b >= n_bins:
-            new_b = n_bins - 1
-        new_hist[new_b] += hist_row[b]
-    return new_hist
-
-
-@njit(cache=True)
-def _accumulate_shard_jit(
-    chunk_idx_f: np.ndarray,
-    values_f: np.ndarray,
-    occ_lo: np.ndarray,
-    occ_hi: np.ndarray,
-    initialized: np.ndarray,
-    hist_counts: np.ndarray,
-    n_bins: int,
-) -> None:
-    """JIT accumulation for one shard: range update + histogram fill.
-
-    Pass 1 — per-cell range update (replaces np.unique / minimum.at /
-              maximum.at / Python for-loop).
-    Pass 2 — histogram fill (replaces np.bincount + hist_ravel +=).
-
-    hist_counts is (n_chunk, n_bins) int32, modified in-place.
-    """
-    n = len(values_f)
-    n_chunk = occ_lo.shape[0]
-
-    # --- Pass 1a: scatter min/max into per-cell accumulators ---------------
-    batch_lo = np.full(n_chunk, np.inf)
-    batch_hi = np.full(n_chunk, -np.inf)
-    for i in range(n):
-        ci = chunk_idx_f[i]
-        v = values_f[i]
-        if v < batch_lo[ci]:
-            batch_lo[ci] = v
-        if v > batch_hi[ci]:
-            batch_hi[ci] = v
-
-    # --- Pass 1b: compare against stored range, rebin where expanded -------
-    for ci in range(n_chunk):
-        b_lo = batch_lo[ci]
-        if b_lo == np.inf:          # cell not present in this shard
-            continue
-        b_hi = batch_hi[ci]
-        if not initialized[ci]:
-            occ_lo[ci] = b_lo
-            occ_hi[ci] = b_hi if b_hi > b_lo else b_lo + 1.0
-            initialized[ci] = True
-        else:
-            new_lo = occ_lo[ci] if occ_lo[ci] < b_lo else b_lo
-            new_hi = occ_hi[ci] if occ_hi[ci] > b_hi else b_hi
-            if new_lo < occ_lo[ci] or new_hi > occ_hi[ci]:
-                hi_safe = new_hi if new_hi > new_lo else new_lo + 1.0
-                hist_counts[ci] = _rebin_histogram(
-                    hist_counts[ci],
-                    occ_lo[ci], occ_hi[ci],
-                    new_lo, hi_safe,
-                    n_bins,
-                )
-                occ_lo[ci] = new_lo
-                occ_hi[ci] = hi_safe
-
-    # --- Pass 2: fill histogram bins ----------------------------------------
-    for i in range(n):
-        ci = chunk_idx_f[i]
-        lo = occ_lo[ci]
-        rng = occ_hi[ci] - lo
-        b = int((values_f[i] - lo) / rng * n_bins)
-        if b < 0:
-            b = 0
-        elif b >= n_bins:
-            b = n_bins - 1
-        hist_counts[ci, b] += 1
-
-
-def _read_raw_shard(
-    shard_path: str,
-    spw_key: str,
-    corr_key: str,
-    cell_to_chunk_idx: NDArray[np.int64],
-    N_v: int,
-    low_count_mask: NDArray[np.bool_],
-    threshold_grid: NDArray | None,
-) -> tuple[NDArray, NDArray, NDArray | None, NDArray | None] | None:
-    """Worker: read shard, filter to chunk cells, return raw values.
-
-    Returns (chunk_idx_f, values_f, exact_ci, exact_v) or None.
-    All heavy work (zarr I/O, numpy) releases the GIL.
-    """
-    root = zarr.open(shard_path, mode="r")
-    try:
-        grp = root[spw_key][corr_key]
-    except KeyError:
-        return None
-
-    cell_u = grp["cell_u"][:]
-    cell_v = grp["cell_v"][:]
-    values = grp["values"][:].astype(np.float64)
     if len(values) == 0:
-        return None
+        return zeros
 
     if threshold_grid is not None:
         thr = threshold_grid[cell_u.astype(np.intp), cell_v.astype(np.intp)]
@@ -244,13 +74,145 @@ def _read_raw_shard(
         cell_v = cell_v[keep]
         values = values[keep]
         if len(values) == 0:
-            return None
+            return zeros
+
+    flat_idx = cell_u.astype(np.int64) * N_v + cell_v.astype(np.int64)
+
+    counts = (
+        np.zeros(n_cells, dtype=np.int64) if skip_counts
+        else np.bincount(flat_idx, minlength=n_cells).astype(np.int64)
+    )
+
+    mins = np.full(n_cells, np.inf, dtype=np.float64)
+    maxs = np.full(n_cells, -np.inf, dtype=np.float64)
+    np.minimum.at(mins, flat_idx, values)
+    np.maximum.at(maxs, flat_idx, values)
+
+    return counts, mins, maxs
+
+
+def pass0_counts_and_ranges(
+    zarr_group: zarr.hierarchy.Group,
+    grid_shape: tuple[int, int],
+    n_threads: int = 4,
+    threshold_grid: NDArray | None = None,
+    pre_counts: NDArray[np.int64] | None = None,
+) -> tuple[NDArray[np.int64], NDArray[np.float64], NDArray[np.float64]]:
+    """Count + min/max per cell over consolidated zarr chunks.
+
+    Returns (cell_count, cell_min, cell_max) — all flat 1-D (n_cells,).
+    When *pre_counts* is provided, bincount is skipped (counts come from
+    the merge step).
+    """
+    N_u, N_v = grid_shape
+    n_cells = N_u * N_v
+
+    if "values" not in zarr_group or zarr_group["values"].shape[0] == 0:
+        return (
+            pre_counts if pre_counts is not None
+            else np.zeros(n_cells, dtype=np.int64),
+            np.full(n_cells, np.inf, dtype=np.float64),
+            np.full(n_cells, -np.inf, dtype=np.float64),
+        )
+
+    total_len = zarr_group["values"].shape[0]
+    chunk_size = zarr_group["values"].chunks[0]
+    chunk_ranges = [
+        (i, min(i + chunk_size, total_len))
+        for i in range(0, total_len, chunk_size)
+    ]
+
+    skip_counts = pre_counts is not None and threshold_grid is None
+    cell_count = (
+        pre_counts.copy() if skip_counts
+        else np.zeros(n_cells, dtype=np.int64)
+    )
+    cell_min = np.full(n_cells, np.inf, dtype=np.float64)
+    cell_max = np.full(n_cells, -np.inf, dtype=np.float64)
+
+    with ThreadPoolExecutor(max_workers=n_threads) as pool:
+        futures = [
+            pool.submit(
+                _pass0_one_chunk, zarr_group, s, e,
+                N_v, n_cells, threshold_grid, skip_counts,
+            )
+            for s, e in chunk_ranges
+        ]
+        for fut in as_completed(futures):
+            counts_c, mins_c, maxs_c = fut.result()
+            if not skip_counts:
+                cell_count += counts_c
+            np.minimum(cell_min, mins_c, out=cell_min)
+            np.maximum(cell_max, maxs_c, out=cell_max)
+
+    return cell_count, cell_min, cell_max
+
+
+# ── Pass 1: fixed-range parallel histogram fill ─────────────────
+
+
+@njit(cache=True)
+def _fill_histogram_jit(
+    chunk_idx: np.ndarray,
+    values: np.ndarray,
+    occ_lo: np.ndarray,
+    occ_hi: np.ndarray,
+    hist_counts: np.ndarray,
+    n_bins: int,
+) -> None:
+    """Fill fixed-range histogram bins (no rebinning)."""
+    for i in range(len(values)):
+        ci = chunk_idx[i]
+        lo = occ_lo[ci]
+        rng = occ_hi[ci] - lo
+        if rng <= 0.0:
+            b = 0
+        else:
+            b = int((values[i] - lo) / rng * n_bins)
+            if b < 0:
+                b = 0
+            elif b >= n_bins:
+                b = n_bins - 1
+        hist_counts[ci, b] += 1
+
+
+def _fill_one_chunk(
+    zarr_group: zarr.hierarchy.Group,
+    start: int,
+    end: int,
+    cell_to_chunk_idx: NDArray[np.int64],
+    N_v: int,
+    occ_lo: NDArray[np.float64],
+    occ_hi: NDArray[np.float64],
+    n_bins: int,
+    n_chunk: int,
+    low_count_mask: NDArray[np.bool_],
+    threshold_grid: NDArray | None,
+) -> tuple[NDArray[np.int32], NDArray | None, NDArray | None]:
+    """Worker: read one zarr chunk, fill fixed-range histogram."""
+    cell_u = zarr_group["cell_u"][start:end]
+    cell_v = zarr_group["cell_v"][start:end]
+    values = zarr_group["values"][start:end].astype(np.float64)
+
+    empty = (np.zeros((n_chunk, n_bins), dtype=np.int32), None, None)
+
+    if len(values) == 0:
+        return empty
+
+    if threshold_grid is not None:
+        thr = threshold_grid[cell_u.astype(np.intp), cell_v.astype(np.intp)]
+        keep = (values <= thr) & ~np.isnan(thr)
+        cell_u = cell_u[keep]
+        cell_v = cell_v[keep]
+        values = values[keep]
+        if len(values) == 0:
+            return empty
 
     flat_idx = cell_u.astype(np.int64) * N_v + cell_v.astype(np.int64)
     chunk_idx = cell_to_chunk_idx[flat_idx]
     in_chunk = chunk_idx >= 0
     if not np.any(in_chunk):
-        return None
+        return empty
 
     chunk_idx_f = chunk_idx[in_chunk]
     values_f = values[in_chunk]
@@ -264,79 +226,76 @@ def _read_raw_shard(
         exact_ci = None
         exact_v = None
 
-    return chunk_idx_f, values_f, exact_ci, exact_v
+    # Fixed-range histogram fill.
+    hist_local = np.zeros((n_chunk, n_bins), dtype=np.int32)
+    _fill_histogram_jit(chunk_idx_f, values_f, occ_lo, occ_hi, hist_local, n_bins)
+
+    return hist_local, exact_ci, exact_v
 
 
-def _adaptive_fill_chunk(
-    shard_paths: list[str],
-    spw_key: str,
-    corr_key: str,
+def parallel_histogram_fill(
+    zarr_group: zarr.hierarchy.Group,
     chunk_cells: NDArray[np.int64],
     cell_to_chunk_idx: NDArray[np.int64],
     occ_count: NDArray[np.int64],
+    cell_min: NDArray[np.float64],
+    cell_max: NDArray[np.float64],
     n_bins: int,
     N_v: int,
     n_threads: int,
     threshold_grid: NDArray | None = None,
 ) -> tuple[NDArray, NDArray, NDArray, NDArray | None, NDArray | None]:
-    """Adaptive histogram fill for a chunk of occupied cells.
-
-    Initialises per-cell ranges from first data seen; rebins on range
-    expansion (rare after first shard).  Shard reads run in threads;
-    histogram accumulation is main-thread only.
+    """Fixed-range parallel histogram fill over zarr chunks.
 
     Returns
     -------
     hist_counts    : (n_chunk, n_bins) int32
-    occ_lo         : (n_chunk,) float64 — actual lower bound used for binning
-    occ_hi         : (n_chunk,) float64 — actual upper bound used for binning
+    occ_lo         : (n_chunk,) float64 — per-cell lower bound
+    occ_hi         : (n_chunk,) float64 — per-cell upper bound
     all_exact_cidx : concatenated chunk indices for exact-path cells, or None
     all_exact_vals : concatenated values for exact-path cells, or None
     """
     n_chunk = len(chunk_cells)
-    hist_counts = np.zeros((n_chunk, n_bins), dtype=np.int32)
-    occ_lo = np.full(n_chunk, np.inf, dtype=np.float64)
-    occ_hi = np.full(n_chunk, -np.inf, dtype=np.float64)
-    initialized = np.zeros(n_chunk, dtype=np.bool_)
+
+    # Per-cell ranges from pass0 (already computed globally).
+    occ_lo = cell_min[chunk_cells].copy()
+    occ_hi = cell_max[chunk_cells].copy()
+    # Ensure hi > lo for cells with constant values.
+    equal_mask = occ_lo >= occ_hi
+    occ_hi[equal_mask] = occ_lo[equal_mask] + 1.0
 
     low_count_mask = occ_count <= _EXACT_THRESHOLD
+
+    total_len = zarr_group["values"].shape[0]
+    chunk_size = zarr_group["values"].chunks[0]
+    chunk_ranges = [
+        (i, min(i + chunk_size, total_len))
+        for i in range(0, total_len, chunk_size)
+    ]
+
+    hist_counts = np.zeros((n_chunk, n_bins), dtype=np.int32)
     exact_cidx_parts: list[NDArray] = []
     exact_vals_parts: list[NDArray] = []
 
-    # Phase 1: parallel I/O — all shards read concurrently, no accumulation yet.
     _t_io = time.perf_counter()
     with ThreadPoolExecutor(max_workers=n_threads) as pool:
-        futs = [
+        futures = [
             pool.submit(
-                _read_raw_shard, sp, spw_key, corr_key,
-                cell_to_chunk_idx, N_v, low_count_mask, threshold_grid,
+                _fill_one_chunk, zarr_group, s, e,
+                cell_to_chunk_idx, N_v, occ_lo, occ_hi,
+                n_bins, n_chunk, low_count_mask, threshold_grid,
             )
-            for sp in shard_paths
+            for s, e in chunk_ranges
         ]
-        shard_results = [f.result() for f in futs]
-    log.debug("  fill I/O phase:          %.3fs (%d shards, %d threads)",
-              time.perf_counter() - _t_io, len(shard_paths), n_threads)
+        for fut in as_completed(futures):
+            hist_c, exact_ci, exact_v = fut.result()
+            hist_counts += hist_c
+            if exact_ci is not None:
+                exact_cidx_parts.append(exact_ci)
+                exact_vals_parts.append(exact_v)
 
-    # Phase 2: serial accumulation — no thread contention.
-    _t_acc = time.perf_counter()
-    for result in shard_results:
-        if result is None:
-            continue
-        chunk_idx_f, values_f, exact_ci, exact_v = result
-
-        # Collect exact values.
-        if exact_ci is not None:
-            exact_cidx_parts.append(exact_ci)
-            exact_vals_parts.append(exact_v)
-
-        # JIT kernel: range update + histogram fill in two tight loops.
-        _accumulate_shard_jit(
-            chunk_idx_f, values_f,
-            occ_lo, occ_hi, initialized,
-            hist_counts, n_bins,
-        )
-
-    log.debug("  fill accumulation phase: %.3fs", time.perf_counter() - _t_acc)
+    log.debug("  fill phase: %.3fs (%d zarr chunks, %d threads)",
+              time.perf_counter() - _t_io, len(chunk_ranges), n_threads)
 
     all_exact_cidx = np.concatenate(exact_cidx_parts) if exact_cidx_parts else None
     all_exact_vals = np.concatenate(exact_vals_parts) if exact_vals_parts else None
@@ -466,37 +425,42 @@ def _extract_chunk(
 
 
 def compute_cell_stats_streaming(
-    shard_paths: list[str],
-    spw_key: str,
-    corr_key: str,
+    zarr_group: zarr.hierarchy.Group,
     grid_shape: tuple[int, int],
     n_bins: int = 256,
     n_threads: int = 4,
     threshold_grid: NDArray | None = None,
+    pre_counts: NDArray[np.int64] | None = None,
 ) -> tuple[NDArray, NDArray, NDArray]:
-    """Adaptive single-pass streaming statistics over zarr shards.
+    """Fixed-range parallel statistics over a consolidated zarr group.
 
-    Pass 0 discovers per-cell counts (skipping value arrays when no
-    threshold is applied, for faster I/O).  Pass 1 fills histograms
-    adaptively, initialising cell ranges on first data and rebinning on
-    range expansion.  Low-count cells (≤ _EXACT_THRESHOLD) are computed
-    exactly via vectorized segmented median/MAD.
+    Pass 0 discovers per-cell counts and value ranges.  Pass 1 fills
+    fixed-range histograms (no rebinning).  Low-count cells
+    (≤ _EXACT_THRESHOLD) are computed exactly via segmented median/MAD.
 
     Returns (median_grid, std_grid, count_grid) with the same shapes
     and semantics as ``gridder.compute_cell_stats``.
 
-    If threshold_grid is provided, only values <= their cell's threshold
-    are included.  Used for computing post-flag "after" grids for plotting.
+    Parameters
+    ----------
+    zarr_group : zarr group containing cell_u, cell_v, values arrays.
+    grid_shape : (N_u, N_v) grid dimensions.
+    n_bins : histogram bin count.
+    n_threads : thread pool size for parallel chunk processing.
+    threshold_grid : if provided, only values ≤ their cell's threshold
+        are included (for post-flag "after" grids).
+    pre_counts : if provided, cell counts from the merge step (skips
+        bincount in pass 0).
     """
     N_u, N_v = grid_shape
     n_cells = N_u * N_v
 
-    # Pass 0: count discovery.
+    # Pass 0: count + range discovery.
     _t0 = time.perf_counter()
-    cell_count = pass0_counts(
-        shard_paths, spw_key, corr_key, grid_shape, n_threads, threshold_grid,
+    cell_count, cell_min, cell_max = pass0_counts_and_ranges(
+        zarr_group, grid_shape, n_threads, threshold_grid, pre_counts,
     )
-    log.debug("Pass0 (count discovery): %.3fs", time.perf_counter() - _t0)
+    log.debug("Pass0 (counts + ranges): %.3fs", time.perf_counter() - _t0)
 
     if cell_count.sum() == 0:
         return (
@@ -509,8 +473,6 @@ def compute_cell_stats_streaming(
     occupied_cells = np.where(cell_count > 0)[0].astype(np.int64)
     n_occupied = len(occupied_cells)
     occ_count_all = cell_count[occupied_cells]
-
-    del cell_count
 
     log.info(
         "Histogram: %d occupied cells (%.1f%% of %d grid cells)",
@@ -544,13 +506,13 @@ def compute_cell_stats_streaming(
         cell_to_chunk = np.full(n_cells, -1, dtype=np.int64)
         cell_to_chunk[chunk_cells] = np.arange(n_chunk, dtype=np.int64)
 
-        # Adaptive histogram fill for this chunk.
+        # Fixed-range histogram fill for this chunk.
         _t_fill = time.perf_counter()
         hist_counts, chunk_lo, chunk_hi, all_exact_cidx, all_exact_vals = (
-            _adaptive_fill_chunk(
-                shard_paths, spw_key, corr_key,
-                chunk_cells, cell_to_chunk,
-                chunk_count, n_bins, N_v, n_threads, threshold_grid,
+            parallel_histogram_fill(
+                zarr_group, chunk_cells, cell_to_chunk,
+                chunk_count, cell_min, cell_max,
+                n_bins, N_v, n_threads, threshold_grid,
             )
         )
         log.debug("Chunk %d/%d fill:    %.3fs", chunk_i + 1, n_chunks, time.perf_counter() - _t_fill)
