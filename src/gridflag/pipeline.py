@@ -320,13 +320,13 @@ def _process_spw_corr(
     spw_id: int,
     corr: int,
     gshape: tuple[int, int],
-    config: "GridFlagConfig",
+    config: GridFlagConfig,
     n_stat_threads: int,
     global_N: int,
-    plot_dir: "str | Path | None",
+    plot_dir: str | Path | None,
     persist_cache: bool,
-    store: "ZarrStore",
-    pre_counts: "np.ndarray | None" = None,
+    store: ZarrStore,
+    pre_counts: np.ndarray | None = None,
 ) -> dict:
     """Run stats → thresholds → flags for one (SPW, corr) pair.
 

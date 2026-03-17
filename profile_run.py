@@ -54,12 +54,14 @@ def run_with_cprofile(ms_path: str, n_workers: int):
 
 def run_with_line_profiler(ms_path: str, n_workers: int):
     from line_profiler import LineProfiler
+
     import gridflag.histogram as hist_mod
     import gridflag.pipeline as pipe_mod
 
     lp = LineProfiler()
-    lp.add_function(hist_mod._read_raw_shard)
-    lp.add_function(hist_mod._adaptive_fill_chunk)
+    lp.add_function(hist_mod._pass0_one_chunk)
+    lp.add_function(hist_mod._fill_one_chunk)
+    lp.add_function(hist_mod.parallel_histogram_fill)
     lp.add_function(hist_mod._extract_chunk)
     lp.add_function(hist_mod.compute_cell_stats_streaming)
     lp.add_function(pipe_mod.run)
