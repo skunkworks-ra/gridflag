@@ -27,17 +27,17 @@ RESULTS_DIR = Path(__file__).parent / "profile_results"
 RESULTS_DIR.mkdir(exist_ok=True)
 
 
-def _call_gridflag(ms_path: str, n_workers: int):
+def _call_gridflag(ms_path: str, n_workers: int, device: str = "auto"):
     from gridflag.config import GridFlagConfig
     from gridflag.pipeline import run
     cfg = GridFlagConfig(n_workers=n_workers)
-    return run(ms_path, config=cfg)
+    return run(ms_path, config=cfg, device=device)
 
 
-def run_with_cprofile(ms_path: str, n_workers: int):
+def run_with_cprofile(ms_path: str, n_workers: int, device: str = "auto"):
     pr = cProfile.Profile()
     pr.enable()
-    _call_gridflag(ms_path, n_workers)
+    _call_gridflag(ms_path, n_workers, device=device)
     pr.disable()
 
     out_path = RESULTS_DIR / "cprofile.txt"
@@ -52,7 +52,7 @@ def run_with_cprofile(ms_path: str, n_workers: int):
     print(f"\n[cProfile] Full stats written to {out_path}")
 
 
-def run_with_line_profiler(ms_path: str, n_workers: int):
+def run_with_line_profiler(ms_path: str, n_workers: int, device: str = "auto"):
     from line_profiler import LineProfiler
 
     import gridflag.histogram as hist_mod
@@ -60,7 +60,6 @@ def run_with_line_profiler(ms_path: str, n_workers: int):
 
     lp = LineProfiler()
     lp.add_function(hist_mod._pass0_read_chunk)
-    lp.add_function(hist_mod._read_chunk_for_fill)
     lp.add_function(hist_mod.parallel_histogram_fill)
     lp.add_function(hist_mod._extract_chunk)
     lp.add_function(hist_mod.compute_cell_stats_streaming)
@@ -69,7 +68,7 @@ def run_with_line_profiler(ms_path: str, n_workers: int):
     from gridflag.config import GridFlagConfig
     from gridflag.pipeline import run
     cfg = GridFlagConfig(n_workers=n_workers)
-    lp(run)(ms_path, config=cfg)
+    lp(run)(ms_path, config=cfg, device=device)
 
     out_path = RESULTS_DIR / "line_profile.txt"
     with open(out_path, "w") as f:
@@ -87,6 +86,8 @@ def main():
     ap.add_argument("--lineprof", action="store_true", help="Run with line_profiler")
     ap.add_argument("--workers", type=int, default=0,
                     help="Number of workers (0 = auto-detect)")
+    ap.add_argument("--device", choices=["auto", "cpu", "gpu"], default="auto",
+                    help="Compute device (default: auto)")
     args = ap.parse_args()
 
     logging.basicConfig(
@@ -99,12 +100,12 @@ def main():
 
     if not args.cprofile and not args.lineprof:
         # Default: plain run (debug logging already enabled above if --debug).
-        _call_gridflag(args.ms_path, args.workers)
+        _call_gridflag(args.ms_path, args.workers, device=args.device)
     else:
         if args.cprofile:
-            run_with_cprofile(args.ms_path, args.workers)
+            run_with_cprofile(args.ms_path, args.workers, device=args.device)
         if args.lineprof:
-            run_with_line_profiler(args.ms_path, args.workers)
+            run_with_line_profiler(args.ms_path, args.workers, device=args.device)
 
 
 if __name__ == "__main__":

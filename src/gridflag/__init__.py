@@ -34,6 +34,7 @@ def gridflag(
     plot_dir: str | None = None,
     persist_cache: bool = False,
     log_level: str = "INFO",
+    device: str = "auto",
 ) -> dict:
     """Run GRIDflag on a CASA Measurement Set.
 
@@ -102,4 +103,5 @@ def gridflag(
         uvrange=uvrange,
     )
 
-    return run(ms_path, config, plot_dir=plot_dir, persist_cache=persist_cache)
+    return run(ms_path, config, plot_dir=plot_dir, persist_cache=persist_cache,
+               device=device)

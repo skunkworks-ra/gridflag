@@ -72,6 +72,13 @@ CONTEXT_SETTINGS = dict(help_option_names=["-h", "--help"])
     show_default=True,
     type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR"]),
 )
+@click.option(
+    "--device",
+    default="auto",
+    show_default=True,
+    type=click.Choice(["auto", "cpu", "gpu"]),
+    help="Compute device (auto detects CUDA GPU).",
+)
 def main(
     ms_path: str | None,
     cell_size: float,
@@ -89,6 +96,7 @@ def main(
     persist_cache: bool,
     plot_cached: str | None,
     log_level: str,
+    device: str,
 ) -> None:
     """Run GRIDflag UV-plane RFI flagging on a CASA Measurement Set."""
     setup_logging(log_level)
@@ -135,7 +143,8 @@ def main(
 
     from gridflag.pipeline import run
 
-    result = run(ms_path, config, plot_dir=plot_dir, persist_cache=persist_cache)
+    result = run(ms_path, config, plot_dir=plot_dir, persist_cache=persist_cache,
+                 device=device)
     click.echo(f"Flagged {result['total_newly_flagged']} visibilities.")
     if result.get("zarr_path"):
         click.echo(f"Zarr store: {result['zarr_path']}")

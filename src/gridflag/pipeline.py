@@ -294,6 +294,7 @@ def _process_spw_corr(
     persist_cache: bool,
     store: ZarrStore,
     pre_counts: np.ndarray | None = None,
+    device: str = "auto",
 ) -> dict:
     """Run stats → thresholds → flags for one (SPW, corr) pair.
 
@@ -316,6 +317,7 @@ def _process_spw_corr(
         n_bins=config.n_bins, n_threads=n_stat_threads,
         pre_counts=pre_counts,
         mem_budget_bytes=avail_bytes,
+        device=device,
     )
 
     n_total = int(count_grid.sum())
@@ -362,6 +364,7 @@ def _process_spw_corr(
             n_bins=config.n_bins, n_threads=n_stat_threads,
             threshold_grid=threshold_grid,
             mem_budget_bytes=avail_bytes,
+            device=device,
         )
         store.store_grid(spw_id, corr, "median_after", median_after)
         store.store_grid(spw_id, corr, "std_after", std_after)
@@ -403,6 +406,7 @@ def run(
     config: GridFlagConfig | None = None,
     plot_dir: str | Path | None = None,
     persist_cache: bool = False,
+    device: str = "auto",
 ) -> dict:
     """Run the full GRIDflag pipeline on a measurement set.
 
@@ -620,6 +624,7 @@ def run(
             zarr_group, spw_id_v, corr, gshape, config,
             n_stat_threads, global_N, plot_dir, persist_cache, store,
             pre_counts=pre_counts,
+            device=device,
         )
         corr = result["corr"]
         n_flagged = result["n_flagged"]

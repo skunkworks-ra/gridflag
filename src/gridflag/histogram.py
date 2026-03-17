@@ -31,6 +31,7 @@ from numba import njit, prange
 from numpy.typing import NDArray
 
 from gridflag.gridder import _segmented_median_mad
+from gridflag import gpu
 
 log = logging.getLogger("gridflag.histogram")
 
@@ -287,6 +288,7 @@ def parallel_histogram_fill(
     cell_min: NDArray[np.float64],
     cell_max: NDArray[np.float64],
     n_bins: int,
+    use_gpu: bool = False,
 ) -> tuple[NDArray, NDArray, NDArray, NDArray | None, NDArray | None]:
     """CPU-only histogram fill from pre-scattered sorted_values.
 
@@ -313,14 +315,24 @@ def parallel_histogram_fill(
     hist_counts = np.zeros((n_chunk, n_bins), dtype=np.int32)
 
     _t_fill = time.perf_counter()
-    _fill_histogram_sorted_jit(
-        chunk_cells, sorted_values, offsets,
-        occ_lo, occ_hi, hist_counts, n_bins,
-    )
-    log.debug(
-        "  prange fill: %.3fs (%d cells)",
-        time.perf_counter() - _t_fill, n_chunk,
-    )
+    if use_gpu:
+        gpu.fill_histogram_cuda(
+            chunk_cells, sorted_values, offsets,
+            occ_lo, occ_hi, hist_counts, n_bins,
+        )
+        log.debug(
+            "  GPU fill: %.3fs (%d cells)",
+            time.perf_counter() - _t_fill, n_chunk,
+        )
+    else:
+        _fill_histogram_sorted_jit(
+            chunk_cells, sorted_values, offsets,
+            occ_lo, occ_hi, hist_counts, n_bins,
+        )
+        log.debug(
+            "  prange fill: %.3fs (%d cells)",
+            time.perf_counter() - _t_fill, n_chunk,
+        )
 
     # Collect exact values for low-count cells by slicing sorted_values.
     low_indices = np.where(low_count_mask)[0]
@@ -418,6 +430,7 @@ def _extract_chunk(
     all_exact_cidx: NDArray[np.int64] | None,
     all_exact_vals: NDArray[np.float64] | None,
     n_bins: int,
+    use_gpu: bool = False,
 ) -> tuple[NDArray[np.float32], NDArray[np.float32]]:
     """Extract median and std for one chunk of occupied cells.
 
@@ -428,10 +441,15 @@ def _extract_chunk(
     n_chunk = len(occ_count)
 
     # JIT extraction for histogram cells.
-    medians, stds = _extract_stats_jit(
-        hist_counts.astype(np.int64), occ_min, occ_max, occ_count,
-        n_bins, n_chunk,
-    )
+    if use_gpu:
+        medians, stds = gpu.extract_stats_cuda(
+            hist_counts, occ_min, occ_max, occ_count, n_bins, n_chunk,
+        )
+    else:
+        medians, stds = _extract_stats_jit(
+            hist_counts.astype(np.int64), occ_min, occ_max, occ_count,
+            n_bins, n_chunk,
+        )
 
     # Vectorized exact path: override low-count cells via _segmented_median_mad.
     if all_exact_cidx is not None and len(all_exact_cidx) > 0:
@@ -443,13 +461,22 @@ def _extract_chunk(
             sorted_cidx, return_index=True, return_counts=True,
         )
 
-        ex_med, ex_std, _ = _segmented_median_mad(
-            sorted_vals,
-            seg_starts.astype(np.int64),
-            seg_counts.astype(np.int64),
-            unique_cidx.astype(np.int64),
-            n_chunk,
-        )
+        if use_gpu:
+            ex_med, ex_std, _ = gpu.segmented_median_mad_cuda(
+                sorted_vals,
+                seg_starts.astype(np.int64),
+                seg_counts.astype(np.int64),
+                unique_cidx.astype(np.int64),
+                n_chunk,
+            )
+        else:
+            ex_med, ex_std, _ = _segmented_median_mad(
+                sorted_vals,
+                seg_starts.astype(np.int64),
+                seg_counts.astype(np.int64),
+                unique_cidx.astype(np.int64),
+                n_chunk,
+            )
 
         medians[unique_cidx] = ex_med[unique_cidx]
         stds[unique_cidx] = ex_std[unique_cidx]
@@ -468,6 +495,7 @@ def compute_cell_stats_streaming(
     threshold_grid: NDArray | None = None,
     pre_counts: NDArray[np.int64] | None = None,
     mem_budget_bytes: int | None = None,
+    device: str = "auto",
 ) -> tuple[NDArray, NDArray, NDArray]:
     """Fixed-range parallel statistics over a consolidated zarr group.
 
@@ -477,13 +505,28 @@ def compute_cell_stats_streaming(
     pass0 discovers filtered counts, then fused scatter uses them.
 
     Histogram fill uses numba prange over cell-sorted values — purely
-    CPU-bound, no I/O.
+    CPU-bound, no I/O.  When device="gpu" or "auto" with a CUDA GPU
+    available, the fill, extraction, and exact-path kernels run on GPU.
 
     Returns (median_grid, std_grid, count_grid).
     """
     N_u, N_v = grid_shape
     n_cells = N_u * N_v
     budget = mem_budget_bytes if mem_budget_bytes is not None else _HIST_MEM_BUDGET
+
+    # Resolve device.
+    if device == "auto":
+        use_gpu = gpu.is_available()
+    elif device == "gpu":
+        use_gpu = True
+        if not gpu.is_available():
+            log.warning("GPU requested but not available; falling back to CPU")
+            use_gpu = False
+    else:
+        use_gpu = False
+
+    if use_gpu:
+        log.info("Using CUDA GPU for histogram kernels")
 
     _t0 = time.perf_counter()
 
@@ -522,12 +565,18 @@ def compute_cell_stats_streaming(
     )
 
     # Chunk sizing: keep histogram array under budget.
-    bytes_per_cell = n_bins * 4  # int32
-    max_cells_per_chunk = max(1, int(budget / bytes_per_cell))
+    total_vis = len(sorted_values)
+    if use_gpu:
+        max_cells_per_chunk = gpu.max_cells_for_vram(total_vis, n_bins)
+        label = "GPU VRAM"
+    else:
+        bytes_per_cell = n_bins * 4  # int32
+        max_cells_per_chunk = max(1, int(budget / bytes_per_cell))
+        label = "CPU RAM"
     n_chunks = math.ceil(n_occupied / max_cells_per_chunk)
     log.info(
-        "Processing in %d chunk(s) (%d cells/chunk, %.1f GB budget)",
-        n_chunks, max_cells_per_chunk, budget / 1024**3,
+        "Processing in %d chunk(s) (%d cells/chunk, %s budget)",
+        n_chunks, max_cells_per_chunk, label,
     )
 
     # Output grids.
@@ -548,6 +597,7 @@ def compute_cell_stats_streaming(
             parallel_histogram_fill(
                 sorted_values, offsets, chunk_cells,
                 chunk_count, cell_min, cell_max, n_bins,
+                use_gpu=use_gpu,
             )
         )
         log.debug(
@@ -560,6 +610,7 @@ def compute_cell_stats_streaming(
         medians, stds = _extract_chunk(
             hist_counts, chunk_lo, chunk_hi, chunk_count,
             all_exact_cidx, all_exact_vals, n_bins,
+            use_gpu=use_gpu,
         )
         log.debug(
             "Chunk %d/%d extract: %.3fs",
