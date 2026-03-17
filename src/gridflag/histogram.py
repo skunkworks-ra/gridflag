@@ -47,6 +47,20 @@ _HIST_MEM_BUDGET = 2 * 1024**3  # 2 GB
 # ── Pass 0: count + range discovery ─────────────────────────────
 
 
+@njit(cache=True)
+def _reduce_pass0_jit(flat_idx, values, cell_count, cell_min, cell_max, skip_counts):
+    """Fused count + min/max reduction — no transient allocations."""
+    for i in range(len(flat_idx)):
+        idx = flat_idx[i]
+        if not skip_counts:
+            cell_count[idx] += 1
+        v = values[i]
+        if v < cell_min[idx]:
+            cell_min[idx] = v
+        if v > cell_max[idx]:
+            cell_max[idx] = v
+
+
 def _pass0_read_chunk(
     zarr_group: zarr.hierarchy.Group,
     start: int,
@@ -123,6 +137,10 @@ def pass0_counts_and_ranges(
     cell_max = np.full(n_cells, -np.inf, dtype=np.float64)
 
     # Phase 1: parallel I/O.  Phase 2: serial reduction.
+    t_io_total = 0.0
+    t_reduce_total = 0.0
+    n_chunks_processed = 0
+
     with ThreadPoolExecutor(max_workers=n_threads) as pool:
         futures = [
             pool.submit(
@@ -131,18 +149,22 @@ def pass0_counts_and_ranges(
             for s, e in chunk_ranges
         ]
         for fut in as_completed(futures):
+            _t_r = time.perf_counter()
             result = fut.result()
             if result is None:
                 continue
             flat_idx, values = result
+            t_io_total += time.perf_counter() - _t_r
 
-            if not skip_counts:
-                cell_count += np.bincount(
-                    flat_idx, minlength=n_cells,
-                ).astype(np.int64)
-            np.minimum.at(cell_min, flat_idx, values)
-            np.maximum.at(cell_max, flat_idx, values)
+            _t_red = time.perf_counter()
+            _reduce_pass0_jit(flat_idx, values, cell_count, cell_min, cell_max, skip_counts)
+            t_reduce_total += time.perf_counter() - _t_red
+            n_chunks_processed += 1
 
+    log.debug(
+        "  pass0: %d zarr chunks, I/O wait %.3fs, reduce %.3fs",
+        n_chunks_processed, t_io_total, t_reduce_total,
+    )
     return cell_count, cell_min, cell_max
 
 
@@ -292,8 +314,8 @@ def parallel_histogram_fill(
                 chunk_idx_f, values_f, occ_lo, occ_hi, hist_counts, n_bins,
             )
 
-    log.debug("  fill phase: %.3fs (%d zarr chunks, %d threads)",
-              time.perf_counter() - _t_io, len(chunk_ranges), n_threads)
+    log.debug("  fill phase: %.3fs (%d zarr reads, %d cells, %d threads)",
+              time.perf_counter() - _t_io, len(chunk_ranges), n_chunk, n_threads)
 
     all_exact_cidx = np.concatenate(exact_cidx_parts) if exact_cidx_parts else None
     all_exact_vals = np.concatenate(exact_vals_parts) if exact_vals_parts else None
@@ -429,6 +451,7 @@ def compute_cell_stats_streaming(
     n_threads: int = 4,
     threshold_grid: NDArray | None = None,
     pre_counts: NDArray[np.int64] | None = None,
+    mem_budget_bytes: int | None = None,
 ) -> tuple[NDArray, NDArray, NDArray]:
     """Fixed-range parallel statistics over a consolidated zarr group.
 
@@ -478,14 +501,14 @@ def compute_cell_stats_streaming(
     )
 
     # Chunk sizing: keep histogram array under budget.
+    budget = mem_budget_bytes if mem_budget_bytes is not None else _HIST_MEM_BUDGET
     bytes_per_cell = n_bins * 4  # int32
-    max_cells_per_chunk = max(1, int(_HIST_MEM_BUDGET / bytes_per_cell))
+    max_cells_per_chunk = max(1, int(budget / bytes_per_cell))
     n_chunks = math.ceil(n_occupied / max_cells_per_chunk)
-    if n_chunks > 1:
-        log.info(
-            "Processing in %d chunks (%d cells/chunk, %.1f GB budget)",
-            n_chunks, max_cells_per_chunk, _HIST_MEM_BUDGET / 1024**3,
-        )
+    log.info(
+        "Processing in %d chunk(s) (%d cells/chunk, %.1f GB budget)",
+        n_chunks, max_cells_per_chunk, budget / 1024**3,
+    )
 
     # Output grids.
     median_grid = np.zeros(n_cells, dtype=np.float32)

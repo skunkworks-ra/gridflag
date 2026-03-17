@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import multiprocessing
+import resource
 import shutil
 import time
 import uuid
@@ -335,11 +336,20 @@ def _process_spw_corr(
     Returns a dict with keys: spw_id, corr, n_total, n_flagged,
     flag_rows, flag_chans, grid_cache_entry.
     """
+    # Dynamic memory budget: use 50% of available RAM, capped by actual need.
+    avail_bytes = int(available_memory_gb() * 0.5 * 1024**3)
+    log.debug(
+        "SPW %d corr %d: memory budget %.1f GB (50%% of %.1f GB available)",
+        spw_id, corr, avail_bytes / 1024**3, available_memory_gb(),
+    )
+
+    _rss_before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     # Streaming statistics.
     median_grid, std_grid, count_grid = compute_cell_stats_streaming(
         zarr_group, gshape,
         n_bins=config.n_bins, n_threads=n_stat_threads,
         pre_counts=pre_counts,
+        mem_budget_bytes=avail_bytes,
     )
 
     n_total = int(count_grid.sum())
@@ -385,6 +395,7 @@ def _process_spw_corr(
             zarr_group, gshape,
             n_bins=config.n_bins, n_threads=n_stat_threads,
             threshold_grid=threshold_grid,
+            mem_budget_bytes=avail_bytes,
         )
         store.store_grid(spw_id, corr, "median_after", median_after)
         store.store_grid(spw_id, corr, "std_after", std_after)
@@ -396,6 +407,17 @@ def _process_spw_corr(
                 "median_after": median_after,
                 "std_after": std_after,
             }
+
+    _rss_after = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    # macOS reports bytes, Linux reports KB
+    import sys
+    _rss_scale = 1 if sys.platform == "linux" else 1024
+    log.debug(
+        "SPW %d corr %d: peak RSS %.1f MB (delta %.1f MB)",
+        spw_id, corr,
+        _rss_after / _rss_scale / 1024**2,
+        (_rss_after - _rss_before) / _rss_scale / 1024**2,
+    )
 
     return {
         "spw_id": spw_id,
