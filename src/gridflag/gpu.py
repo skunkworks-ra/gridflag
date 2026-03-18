@@ -67,7 +67,12 @@ def max_cells_for_vram(
 
     Returns the max number of cells that fit, or total_vis if everything fits.
     """
-    free = int(free_vram_bytes() * headroom)
+    free_raw = free_vram_bytes()
+    free = int(free_raw * headroom)
+    log.debug(
+        "VRAM budget: %.2f GB free (%.0f%% headroom → %.2f GB usable)",
+        free_raw / 1024**3, headroom * 100, free / 1024**3,
+    )
     # Fixed cost: sorted_values for the whole dataset
     sv_bytes = 8 * total_vis
     if sv_bytes >= free:
@@ -265,6 +270,8 @@ def fill_histogram_cuda(
     )
 
     d_hist.copy_to_host(hist_counts)
+    del d_chunk_cells, d_sorted, d_offsets, d_lo, d_hi, d_hist
+    _cuda.current_context().deallocations.clear()
 
 
 def extract_stats_cuda(
@@ -282,7 +289,7 @@ def extract_stats_cuda(
     medians = np.zeros(n_chunk, dtype=np.float32)
     stds = np.zeros(n_chunk, dtype=np.float32)
 
-    d_hist = _cuda.to_device(hist_counts.astype(np.int64))
+    d_hist = _cuda.to_device(hist_counts)
     d_min = _cuda.to_device(occ_min)
     d_max = _cuda.to_device(occ_max)
     d_count = _cuda.to_device(occ_count)
@@ -295,6 +302,8 @@ def extract_stats_cuda(
 
     d_med.copy_to_host(medians)
     d_std.copy_to_host(stds)
+    del d_hist, d_min, d_max, d_count, d_med, d_std
+    _cuda.current_context().deallocations.clear()
     return medians, stds
 
 
@@ -329,4 +338,6 @@ def segmented_median_mad_cuda(
     d_med.copy_to_host(median_flat)
     d_std.copy_to_host(std_flat)
     d_cnt.copy_to_host(count_flat)
+    del d_vals, d_starts, d_counts, d_cells, d_med, d_std, d_cnt
+    _cuda.current_context().deallocations.clear()
     return median_flat, std_flat, count_flat
