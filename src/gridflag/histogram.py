@@ -288,7 +288,6 @@ def parallel_histogram_fill(
     cell_min: NDArray[np.float64],
     cell_max: NDArray[np.float64],
     n_bins: int,
-    use_gpu: bool = False,
 ) -> tuple[NDArray, NDArray, NDArray, NDArray | None, NDArray | None]:
     """CPU-only histogram fill from pre-scattered sorted_values.
 
@@ -315,24 +314,14 @@ def parallel_histogram_fill(
     hist_counts = np.zeros((n_chunk, n_bins), dtype=np.int32)
 
     _t_fill = time.perf_counter()
-    if use_gpu:
-        gpu.fill_histogram_cuda(
-            chunk_cells, sorted_values, offsets,
-            occ_lo, occ_hi, hist_counts, n_bins,
-        )
-        log.debug(
-            "  GPU fill: %.3fs (%d cells)",
-            time.perf_counter() - _t_fill, n_chunk,
-        )
-    else:
-        _fill_histogram_sorted_jit(
-            chunk_cells, sorted_values, offsets,
-            occ_lo, occ_hi, hist_counts, n_bins,
-        )
-        log.debug(
-            "  prange fill: %.3fs (%d cells)",
-            time.perf_counter() - _t_fill, n_chunk,
-        )
+    _fill_histogram_sorted_jit(
+        chunk_cells, sorted_values, offsets,
+        occ_lo, occ_hi, hist_counts, n_bins,
+    )
+    log.debug(
+        "  prange fill: %.3fs (%d cells)",
+        time.perf_counter() - _t_fill, n_chunk,
+    )
 
     # Collect exact values for low-count cells by slicing sorted_values.
     low_indices = np.where(low_count_mask)[0]
@@ -430,9 +419,8 @@ def _extract_chunk(
     all_exact_cidx: NDArray[np.int64] | None,
     all_exact_vals: NDArray[np.float64] | None,
     n_bins: int,
-    use_gpu: bool = False,
 ) -> tuple[NDArray[np.float32], NDArray[np.float32]]:
-    """Extract median and std for one chunk of occupied cells.
+    """CPU-only: extract median and std for one chunk of occupied cells.
 
     Histogram-based stats are computed for all cells via JIT; low-count
     cells (≤ _EXACT_THRESHOLD) are overridden with exact median/MAD using
@@ -440,16 +428,10 @@ def _extract_chunk(
     """
     n_chunk = len(occ_count)
 
-    # JIT extraction for histogram cells.
-    if use_gpu:
-        medians, stds = gpu.extract_stats_cuda(
-            hist_counts, occ_min, occ_max, occ_count, n_bins, n_chunk,
-        )
-    else:
-        medians, stds = _extract_stats_jit(
-            hist_counts.astype(np.int64), occ_min, occ_max, occ_count,
-            n_bins, n_chunk,
-        )
+    medians, stds = _extract_stats_jit(
+        hist_counts.astype(np.int64), occ_min, occ_max, occ_count,
+        n_bins, n_chunk,
+    )
 
     # Vectorized exact path: override low-count cells via _segmented_median_mad.
     if all_exact_cidx is not None and len(all_exact_cidx) > 0:
@@ -461,27 +443,83 @@ def _extract_chunk(
             sorted_cidx, return_index=True, return_counts=True,
         )
 
-        if use_gpu:
-            ex_med, ex_std, _ = gpu.segmented_median_mad_cuda(
-                sorted_vals,
-                seg_starts.astype(np.int64),
-                seg_counts.astype(np.int64),
-                unique_cidx.astype(np.int64),
-                n_chunk,
-            )
-        else:
-            ex_med, ex_std, _ = _segmented_median_mad(
-                sorted_vals,
-                seg_starts.astype(np.int64),
-                seg_counts.astype(np.int64),
-                unique_cidx.astype(np.int64),
-                n_chunk,
-            )
+        ex_med, ex_std, _ = _segmented_median_mad(
+            sorted_vals,
+            seg_starts.astype(np.int64),
+            seg_counts.astype(np.int64),
+            unique_cidx.astype(np.int64),
+            n_chunk,
+        )
 
         medians[unique_cidx] = ex_med[unique_cidx]
         stds[unique_cidx] = ex_std[unique_cidx]
 
     return medians, stds
+
+
+def _apply_exact_overrides(
+    medians: NDArray[np.float32],
+    stds: NDArray[np.float32],
+    chunk_cells: NDArray[np.int64],
+    chunk_count: NDArray[np.int64],
+    sorted_values: NDArray[np.float64],
+    offsets: NDArray[np.int64],
+    use_gpu: bool,
+) -> None:
+    """Override histogram stats with exact median/MAD for low-count cells.
+
+    Collects values for cells with count ≤ _EXACT_THRESHOLD, then
+    dispatches to GPU or CPU segmented median/MAD.  Modifies medians
+    and stds in-place.
+    """
+    low_count_mask = chunk_count <= _EXACT_THRESHOLD
+    low_indices = np.where(low_count_mask)[0]
+    if len(low_indices) == 0:
+        return
+
+    exact_cidx_parts: list[NDArray] = []
+    exact_vals_parts: list[NDArray] = []
+    for ci in low_indices:
+        cell = chunk_cells[ci]
+        vals = sorted_values[offsets[cell]:offsets[cell + 1]]
+        if len(vals) > 0:
+            exact_cidx_parts.append(np.full(len(vals), ci, dtype=np.int64))
+            exact_vals_parts.append(vals)
+
+    if not exact_cidx_parts:
+        return
+
+    all_exact_cidx = np.concatenate(exact_cidx_parts)
+    all_exact_vals = np.concatenate(exact_vals_parts)
+
+    sort_order = np.argsort(all_exact_cidx, kind="stable")
+    sorted_cidx = all_exact_cidx[sort_order]
+    sorted_vals = all_exact_vals[sort_order].astype(np.float32)
+
+    unique_cidx, seg_starts, seg_counts = np.unique(
+        sorted_cidx, return_index=True, return_counts=True,
+    )
+
+    n_chunk = len(chunk_count)
+    if use_gpu:
+        ex_med, ex_std, _ = gpu.segmented_median_mad_cuda(
+            sorted_vals,
+            seg_starts.astype(np.int64),
+            seg_counts.astype(np.int64),
+            unique_cidx.astype(np.int64),
+            n_chunk,
+        )
+    else:
+        ex_med, ex_std, _ = _segmented_median_mad(
+            sorted_vals,
+            seg_starts.astype(np.int64),
+            seg_counts.astype(np.int64),
+            unique_cidx.astype(np.int64),
+            n_chunk,
+        )
+
+    medians[unique_cidx] = ex_med[unique_cidx]
+    stds[unique_cidx] = ex_std[unique_cidx]
 
 
 # ── Convenience: full pipeline ───────────────────────────────────
@@ -568,7 +606,7 @@ def compute_cell_stats_streaming(
     total_vis = len(sorted_values)
     if use_gpu:
         max_cells_per_chunk = gpu.max_cells_for_vram(
-            total_vis, n_occupied, n_cells, n_bins,
+            total_vis, n_occupied, n_bins,
         )
         label = "GPU VRAM"
     else:
@@ -586,45 +624,65 @@ def compute_cell_stats_streaming(
     std_grid = np.zeros(n_cells, dtype=np.float32)
     count_grid = np.zeros(n_cells, dtype=np.int32)
 
-    # Process occupied cells in chunks (CPU-only — no I/O).
+    # Process occupied cells in chunks (no I/O).
     for chunk_i in range(n_chunks):
         c_start = chunk_i * max_cells_per_chunk
         c_end = min(c_start + max_cells_per_chunk, n_occupied)
         chunk_cells = occupied_cells[c_start:c_end]
         chunk_count = occ_count_all[c_start:c_end]
 
-        # Prange histogram fill (no zarr I/O).
-        _t_fill = time.perf_counter()
-        hist_counts, chunk_lo, chunk_hi, all_exact_cidx, all_exact_vals = (
-            parallel_histogram_fill(
-                sorted_values, offsets, chunk_cells,
-                chunk_count, cell_min, cell_max, n_bins,
-                use_gpu=use_gpu,
-            )
-        )
-        log.debug(
-            "Chunk %d/%d fill:    %.3fs",
-            chunk_i + 1, n_chunks, time.perf_counter() - _t_fill,
-        )
+        if use_gpu:
+            # Fused GPU path: fill + extract in single dispatch,
+            # hist_counts never leaves GPU, offsets never transferred.
+            occ_lo = cell_min[chunk_cells].copy()
+            occ_hi = cell_max[chunk_cells].copy()
+            equal_mask = occ_lo >= occ_hi
+            occ_hi[equal_mask] = occ_lo[equal_mask] + 1.0
 
-        # Extract stats for this chunk.
-        _t_ext = time.perf_counter()
-        medians, stds = _extract_chunk(
-            hist_counts, chunk_lo, chunk_hi, chunk_count,
-            all_exact_cidx, all_exact_vals, n_bins,
-            use_gpu=use_gpu,
-        )
-        log.debug(
-            "Chunk %d/%d extract: %.3fs",
-            chunk_i + 1, n_chunks, time.perf_counter() - _t_ext,
-        )
+            _t_gpu = time.perf_counter()
+            medians, stds = gpu.fill_and_extract_cuda(
+                chunk_cells, sorted_values, offsets,
+                occ_lo, occ_hi, chunk_count, n_bins,
+            )
+            log.debug(
+                "Chunk %d/%d GPU fused: %.3fs",
+                chunk_i + 1, n_chunks, time.perf_counter() - _t_gpu,
+            )
+
+            # Exact-path override for low-count cells.
+            _apply_exact_overrides(
+                medians, stds, chunk_cells, chunk_count,
+                sorted_values, offsets, use_gpu,
+            )
+        else:
+            # CPU path: separate fill + extract.
+            _t_fill = time.perf_counter()
+            hist_counts, chunk_lo, chunk_hi, all_exact_cidx, all_exact_vals = (
+                parallel_histogram_fill(
+                    sorted_values, offsets, chunk_cells,
+                    chunk_count, cell_min, cell_max, n_bins,
+                )
+            )
+            log.debug(
+                "Chunk %d/%d fill:    %.3fs",
+                chunk_i + 1, n_chunks, time.perf_counter() - _t_fill,
+            )
+
+            _t_ext = time.perf_counter()
+            medians, stds = _extract_chunk(
+                hist_counts, chunk_lo, chunk_hi, chunk_count,
+                all_exact_cidx, all_exact_vals, n_bins,
+            )
+            log.debug(
+                "Chunk %d/%d extract: %.3fs",
+                chunk_i + 1, n_chunks, time.perf_counter() - _t_ext,
+            )
+            del hist_counts, all_exact_cidx, all_exact_vals
 
         # Scatter into output grids.
         median_grid[chunk_cells] = medians
         std_grid[chunk_cells] = stds
         count_grid[chunk_cells] = chunk_count.astype(np.int32)
-
-        del hist_counts, all_exact_cidx, all_exact_vals
 
     del sorted_values  # free the large scatter buffer
 

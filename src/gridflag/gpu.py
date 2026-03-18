@@ -1,9 +1,9 @@
 """GPU runtime detection, VRAM management, and CUDA kernels.
 
-Provides CUDA-accelerated versions of the three compute-hot kernels:
-  1. _fill_histogram_cuda — histogram binning from cell-sorted values
-  2. _extract_stats_cuda — median + IQR extraction from histograms
-  3. _segmented_median_mad_cuda — exact median/MAD for low-count cells
+Provides CUDA-accelerated kernels:
+  1. fill_and_extract_cuda — fused histogram fill + stats extraction
+     (hist_counts never leaves GPU; offsets never transferred)
+  2. segmented_median_mad_cuda — exact median/MAD for low-count cells
 
 All kernels have CPU fallbacks; calling code selects based on is_available().
 """
@@ -51,22 +51,20 @@ def free_vram_bytes() -> int:
 def max_cells_for_vram(
     total_vis: int,
     n_occupied: int,
-    n_total_cells: int,
     n_bins: int,
     headroom: float = 0.85,
 ) -> int:
     """Estimate how many cells we can process in one GPU batch.
 
-    Peak VRAM during fill (all coexist on device):
+    Peak VRAM during fused fill+extract (all coexist on device):
       sorted_values slice:  8 * C * (total_vis / n_occupied)  (float64, proportional)
-      offsets:              8 * (n_total_cells + 1)            (int64, fixed)
-      chunk_cells:          8 * C                              (int64)
+      chunk_starts/ends:    16 * C                             (int64 × 2)
       occ_lo/hi:            16 * C                             (float64 × 2)
+      occ_count:            8 * C                              (int64)
       hist_counts:          4 * C * n_bins                     (int32)
       medians/stds:         8 * C                              (float32 × 2)
 
-    Only the sorted_values slice for the chunk's cells is transferred,
-    not the full array.
+    No fixed offsets array — compact starts/ends replace it.
     """
     free_raw = free_vram_bytes()
     free = int(free_raw * headroom)
@@ -75,24 +73,18 @@ def max_cells_for_vram(
         free_raw / 1024**3, headroom * 100, free / 1024**3,
     )
 
-    # Fixed cost: offsets array (full, indexed by cell id).
-    fixed = 8 * (n_total_cells + 1)
-    usable = free - fixed
-    if usable <= 0:
-        return 1
-
     # Per-cell cost: proportional sorted_values slice + hist + metadata.
     avg_vis_per_cell = total_vis / max(n_occupied, 1)
     per_cell = (
         int(8 * avg_vis_per_cell)  # sorted_values slice (float64)
         + 4 * n_bins               # hist_counts (int32)
-        + 8                        # chunk_cells (int64)
+        + 16                       # chunk_starts + chunk_ends (int64 × 2)
         + 16                       # occ_lo + occ_hi (float64 × 2)
         + 8                        # occ_count (int64)
         + 8                        # medians + stds (float32 × 2)
     )
 
-    max_c = max(1, int(usable / per_cell))
+    max_c = max(1, int(free / per_cell))
     log.info(
         "VRAM budget: %.0f B/cell (%.0f vis/cell avg), max %d cells/chunk",
         per_cell, avg_vis_per_cell, max_c,
@@ -113,19 +105,18 @@ def _get_kernels():
 
     from numba import cuda
 
-    # ── Kernel 1: histogram fill ──────────────────────────────────
+    # ── Kernel 1: histogram fill (v2, compact starts/ends) ────────
 
     @cuda.jit
-    def _fill_histogram_kernel(chunk_cells, sorted_values, offsets,
-                               occ_lo, occ_hi, hist_counts, n_bins):
+    def _fill_histogram_kernel_v2(sorted_values, chunk_starts, chunk_ends,
+                                  occ_lo, occ_hi, hist_counts, n_bins):
         ci = cuda.grid(1)
-        if ci >= chunk_cells.shape[0]:
+        if ci >= chunk_starts.shape[0]:
             return
-        cell = chunk_cells[ci]
+        start = chunk_starts[ci]
+        end = chunk_ends[ci]
         lo = occ_lo[ci]
         rng = occ_hi[ci] - lo
-        start = offsets[cell]
-        end = offsets[cell + 1]
         for j in range(start, end):
             v = sorted_values[j]
             if rng <= 0.0:
@@ -239,7 +230,7 @@ def _get_kernels():
         std_flat[cell] = np.float32(1.4826) * mad
         count_flat[cell] = n
 
-    _compiled_kernels["fill_histogram"] = _fill_histogram_kernel
+    _compiled_kernels["fill_histogram_v2"] = _fill_histogram_kernel_v2
     _compiled_kernels["extract_stats"] = _extract_stats_kernel
     _compiled_kernels["segmented_median_mad"] = _segmented_median_mad_kernel
 
@@ -251,84 +242,73 @@ def _get_kernels():
 _BLOCK_SIZE = 256
 
 
-def fill_histogram_cuda(
+def fill_and_extract_cuda(
     chunk_cells: NDArray[np.int64],
     sorted_values: NDArray[np.float64],
     offsets: NDArray[np.int64],
     occ_lo: NDArray[np.float64],
     occ_hi: NDArray[np.float64],
-    hist_counts: NDArray[np.int32],
+    occ_count: NDArray[np.int64],
     n_bins: int,
-) -> None:
-    """GPU histogram fill — in-place into hist_counts.
+) -> tuple[NDArray[np.float32], NDArray[np.float32]]:
+    """Fused GPU histogram fill + stats extraction.
 
-    Only transfers the contiguous slice of sorted_values covering this
-    chunk's cells, with offsets adjusted to be relative to the slice start.
+    hist_counts never leaves the GPU. The full offsets array is never
+    transferred — compact chunk_starts/chunk_ends are computed on CPU
+    and sent instead.
+
+    Returns (medians, stds).
     """
     kernels = _get_kernels()
     n_chunk = len(chunk_cells)
     grid_dim = math.ceil(n_chunk / _BLOCK_SIZE)
 
-    # Only transfer the slice of sorted_values needed for this chunk.
-    # sorted_values is cell-sorted and chunk_cells are in order, so the
-    # range offsets[first_cell] .. offsets[last_cell+1] is contiguous.
+    # Compute the contiguous sorted_values slice for this chunk.
     sv_start = int(offsets[chunk_cells[0]])
     sv_end = int(offsets[chunk_cells[-1] + 1])
     sv_slice = sorted_values[sv_start:sv_end]
 
-    # Adjust offsets so the kernel indexes into the slice, not the full array.
-    adj_offsets = offsets - sv_start
+    # Compact starts/ends relative to the slice (n_chunk-sized, not n_cells).
+    chunk_starts = offsets[chunk_cells] - sv_start
+    chunk_ends = offsets[chunk_cells + 1] - sv_start
 
     log.debug(
-        "  GPU H2D: sorted_values slice %.2f GB (of %.2f GB total)",
+        "  GPU H2D: sorted_values slice %.2f GB (of %.2f GB total), "
+        "starts/ends %.2f MB",
         sv_slice.nbytes / 1024**3, sorted_values.nbytes / 1024**3,
+        (chunk_starts.nbytes + chunk_ends.nbytes) / 1024**2,
     )
 
-    d_chunk_cells = _cuda.to_device(chunk_cells)
+    # Allocate all device arrays once.
     d_sorted = _cuda.to_device(sv_slice)
-    d_offsets = _cuda.to_device(adj_offsets)
+    d_starts = _cuda.to_device(chunk_starts)
+    d_ends = _cuda.to_device(chunk_ends)
     d_lo = _cuda.to_device(occ_lo)
     d_hi = _cuda.to_device(occ_hi)
-    d_hist = _cuda.to_device(hist_counts)
-
-    kernels["fill_histogram"][grid_dim, _BLOCK_SIZE](
-        d_chunk_cells, d_sorted, d_offsets, d_lo, d_hi, d_hist, n_bins,
-    )
-
-    d_hist.copy_to_host(hist_counts)
-    del d_chunk_cells, d_sorted, d_offsets, d_lo, d_hi, d_hist
-    _cuda.current_context().deallocations.clear()
-
-
-def extract_stats_cuda(
-    hist_counts: NDArray,
-    occ_min: NDArray[np.float64],
-    occ_max: NDArray[np.float64],
-    occ_count: NDArray[np.int64],
-    n_bins: int,
-    n_chunk: int,
-) -> tuple[NDArray[np.float32], NDArray[np.float32]]:
-    """GPU stats extraction — returns (medians, stds)."""
-    kernels = _get_kernels()
-    grid_dim = math.ceil(n_chunk / _BLOCK_SIZE)
-
+    d_count = _cuda.to_device(occ_count)
     medians = np.zeros(n_chunk, dtype=np.float32)
     stds = np.zeros(n_chunk, dtype=np.float32)
-
-    d_hist = _cuda.to_device(hist_counts)
-    d_min = _cuda.to_device(occ_min)
-    d_max = _cuda.to_device(occ_max)
-    d_count = _cuda.to_device(occ_count)
+    d_hist = _cuda.to_device(np.zeros((n_chunk, n_bins), dtype=np.int32))
     d_med = _cuda.to_device(medians)
     d_std = _cuda.to_device(stds)
 
-    kernels["extract_stats"][grid_dim, _BLOCK_SIZE](
-        d_hist, d_min, d_max, d_count, n_bins, d_med, d_std,
+    # Launch fill kernel.
+    kernels["fill_histogram_v2"][grid_dim, _BLOCK_SIZE](
+        d_sorted, d_starts, d_ends, d_lo, d_hi, d_hist, n_bins,
     )
+    _cuda.synchronize()
 
+    # Launch extract kernel (d_hist stays on GPU).
+    kernels["extract_stats"][grid_dim, _BLOCK_SIZE](
+        d_hist, d_lo, d_hi, d_count, n_bins, d_med, d_std,
+    )
+    _cuda.synchronize()
+
+    # D2H: only medians and stds.
     d_med.copy_to_host(medians)
     d_std.copy_to_host(stds)
-    del d_hist, d_min, d_max, d_count, d_med, d_std
+
+    del d_sorted, d_starts, d_ends, d_lo, d_hi, d_count, d_hist, d_med, d_std
     _cuda.current_context().deallocations.clear()
     return medians, stds
 
