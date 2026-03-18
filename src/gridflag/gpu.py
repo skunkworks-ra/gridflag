@@ -50,47 +50,54 @@ def free_vram_bytes() -> int:
 
 def max_cells_for_vram(
     total_vis: int,
+    n_occupied: int,
+    n_total_cells: int,
     n_bins: int,
-    headroom: float = 0.9,
+    headroom: float = 0.85,
 ) -> int:
     """Estimate how many cells we can process in one GPU batch.
 
-    Memory model per batch of C cells covering V values:
-      sorted_values slice:  8 * V  bytes  (float64)
-      offsets:              8 * (C+1)     (int64)
-      chunk_cells:          8 * C         (int64)
-      occ_lo/hi:            16 * C        (float64 × 2)
-      occ_count:            8 * C         (int64)
-      hist_counts:          4 * C * n_bins (int32)
-      medians/stds:         8 * C         (float32 × 2)
-    Dominant term is the sorted_values slice.
+    Peak VRAM during fill (all coexist on device):
+      sorted_values slice:  8 * C * (total_vis / n_occupied)  (float64, proportional)
+      offsets:              8 * (n_total_cells + 1)            (int64, fixed)
+      chunk_cells:          8 * C                              (int64)
+      occ_lo/hi:            16 * C                             (float64 × 2)
+      hist_counts:          4 * C * n_bins                     (int32)
+      medians/stds:         8 * C                              (float32 × 2)
 
-    Returns the max number of cells that fit, or total_vis if everything fits.
+    Only the sorted_values slice for the chunk's cells is transferred,
+    not the full array.
     """
     free_raw = free_vram_bytes()
     free = int(free_raw * headroom)
-    log.debug(
-        "VRAM budget: %.2f GB free (%.0f%% headroom → %.2f GB usable)",
+    log.info(
+        "VRAM: %.2f GB free, %.0f%% headroom → %.2f GB usable",
         free_raw / 1024**3, headroom * 100, free / 1024**3,
     )
-    # Fixed cost: sorted_values for the whole dataset
-    sv_bytes = 8 * total_vis
-    if sv_bytes >= free:
-        # Must sub-chunk; estimate cells per sub-chunk
-        # Each sub-chunk transfers a proportional slice of sorted_values
-        # plus per-cell overhead
-        per_cell_overhead = 8 + 16 + 8 + 4 * n_bins + 8  # offsets, lo/hi, count, hist, out
-        # Assume uniform distribution: avg_vis_per_cell
-        # We'll compute exact fits in the caller; return a conservative estimate
-        usable = free - 1024 * 1024  # 1 MB headroom for misc
-        if usable <= 0:
-            return 1
-        return max(1, int(usable / (per_cell_overhead + 8 * 64)))  # rough avg 64 vis/cell
-    else:
-        # Everything fits; return large number
-        remaining = free - sv_bytes
-        per_cell = 8 + 16 + 8 + 4 * n_bins + 8
-        return max(1, int(remaining / per_cell))
+
+    # Fixed cost: offsets array (full, indexed by cell id).
+    fixed = 8 * (n_total_cells + 1)
+    usable = free - fixed
+    if usable <= 0:
+        return 1
+
+    # Per-cell cost: proportional sorted_values slice + hist + metadata.
+    avg_vis_per_cell = total_vis / max(n_occupied, 1)
+    per_cell = (
+        int(8 * avg_vis_per_cell)  # sorted_values slice (float64)
+        + 4 * n_bins               # hist_counts (int32)
+        + 8                        # chunk_cells (int64)
+        + 16                       # occ_lo + occ_hi (float64 × 2)
+        + 8                        # occ_count (int64)
+        + 8                        # medians + stds (float32 × 2)
+    )
+
+    max_c = max(1, int(usable / per_cell))
+    log.info(
+        "VRAM budget: %.0f B/cell (%.0f vis/cell avg), max %d cells/chunk",
+        per_cell, avg_vis_per_cell, max_c,
+    )
+    return max_c
 
 
 # ── CUDA Kernels ─────────────────────────────────────────────────
@@ -253,14 +260,33 @@ def fill_histogram_cuda(
     hist_counts: NDArray[np.int32],
     n_bins: int,
 ) -> None:
-    """GPU histogram fill — in-place into hist_counts."""
+    """GPU histogram fill — in-place into hist_counts.
+
+    Only transfers the contiguous slice of sorted_values covering this
+    chunk's cells, with offsets adjusted to be relative to the slice start.
+    """
     kernels = _get_kernels()
     n_chunk = len(chunk_cells)
     grid_dim = math.ceil(n_chunk / _BLOCK_SIZE)
 
+    # Only transfer the slice of sorted_values needed for this chunk.
+    # sorted_values is cell-sorted and chunk_cells are in order, so the
+    # range offsets[first_cell] .. offsets[last_cell+1] is contiguous.
+    sv_start = int(offsets[chunk_cells[0]])
+    sv_end = int(offsets[chunk_cells[-1] + 1])
+    sv_slice = sorted_values[sv_start:sv_end]
+
+    # Adjust offsets so the kernel indexes into the slice, not the full array.
+    adj_offsets = offsets - sv_start
+
+    log.debug(
+        "  GPU H2D: sorted_values slice %.2f GB (of %.2f GB total)",
+        sv_slice.nbytes / 1024**3, sorted_values.nbytes / 1024**3,
+    )
+
     d_chunk_cells = _cuda.to_device(chunk_cells)
-    d_sorted = _cuda.to_device(sorted_values)
-    d_offsets = _cuda.to_device(offsets)
+    d_sorted = _cuda.to_device(sv_slice)
+    d_offsets = _cuda.to_device(adj_offsets)
     d_lo = _cuda.to_device(occ_lo)
     d_hi = _cuda.to_device(occ_hi)
     d_hist = _cuda.to_device(hist_counts)

@@ -567,7 +567,9 @@ def compute_cell_stats_streaming(
     # Chunk sizing: keep histogram array under budget.
     total_vis = len(sorted_values)
     if use_gpu:
-        max_cells_per_chunk = gpu.max_cells_for_vram(total_vis, n_bins)
+        max_cells_per_chunk = gpu.max_cells_for_vram(
+            total_vis, n_occupied, n_cells, n_bins,
+        )
         label = "GPU VRAM"
     else:
         bytes_per_cell = n_bins * 4  # int32
